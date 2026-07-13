@@ -1,0 +1,170 @@
+# =============================================================================
+# HOUSE VIEW - config
+# =============================================================================
+# provider_mode decides where release data comes from. It is the ONLY line that
+# differs between machines:
+#   - work PC (Bloomberg Terminal running):  provider_mode: blpapi
+#   - Mac / offline:                          provider_mode: snapshot
+# You can also override it without editing this file by setting the environment
+# variable HV_PROVIDER_MODE.
+#
+# Ships as `snapshot` so it runs immediately with no Bloomberg. Flip to `blpapi`
+# on the work PC once you have confirmed the tickers and fields below.
+# =============================================================================
+
+provider_mode: snapshot
+
+# ---- Snapshot (Mac / offline) ----------------------------------------------
+snapshot:
+  path: providers/releases_snapshot.json
+
+# ---- Bloomberg (blpapi, work PC) -------------------------------------------
+blpapi:
+  host: localhost
+  port: 8194
+  ticker_key: ticker            # which key on each release below holds the BBG id
+  window_back_days: 120
+  window_fwd_days: 45
+  snapshot_fallback: providers/releases_snapshot.json   # used if Terminal is closed
+  # VERIFY every mnemonic against your real tickers with FLDS<GO> before a live run.
+  fields:
+    release_date_list: ECO_FUTURE_RELEASE_DATE_LIST
+    consensus: BN_SURVEY_MEDIAN
+    actual: ACTUAL_RELEASE
+    previous: PREVIOUS_VALUE
+    period_end: ECO_RELEASE_PERIOD_END_DATE
+
+# =============================================================================
+# RELEASE UNIVERSE
+# =============================================================================
+# Static metadata for each tracked release. In snapshot mode the numbers come
+# from releases_snapshot.json and this block is reference only. In blpapi mode
+# the provider reads `ticker` here and merges the live numbers onto this metadata.
+#
+# TICKERS ARE BEST-GUESS PLACEHOLDERS. Confirm each on the Terminal (SECF<GO> /
+# ECO<GO>) before trusting a live blpapi run; a wrong ticker is the usual reason
+# a print comes back blank.
+#
+# higher_is: what a HIGHER-than-expected number means -> "hawkish" | "good" | "bad"
+# =============================================================================
+releases:
+
+  - event: "US CPI YoY"
+    region: "US"
+    pillar: "Prices"
+    theme: "inflation"
+    impact: "high"
+    assets: ["UST", "USD", "Equities"]
+    higher_is: "hawkish"
+    unit: "%"
+    ticker: "CPI YOY Index"          # VERIFY
+
+  - event: "US Core PCE YoY"
+    region: "US"
+    pillar: "Prices"
+    theme: "inflation"
+    impact: "high"
+    assets: ["UST", "USD"]
+    higher_is: "hawkish"
+    unit: "%"
+    ticker: "PCE CYOY Index"         # VERIFY
+
+  - event: "UK CPI YoY"
+    region: "UK"
+    pillar: "Prices"
+    theme: "inflation"
+    impact: "high"
+    assets: ["Gilts", "GBP"]
+    higher_is: "hawkish"
+    unit: "%"
+    ticker: "UKRPCJYR Index"         # VERIFY (this may be RPI; confirm CPI YoY code)
+
+  - event: "Euro Area CPI YoY Flash"
+    region: "Euro Area"
+    pillar: "Prices"
+    theme: "inflation"
+    impact: "high"
+    assets: ["Bunds", "EUR"]
+    higher_is: "hawkish"
+    unit: "%"
+    ticker: "ECCPEMUY Index"         # VERIFY
+
+  - event: "US Non Farm Payrolls"
+    region: "US"
+    pillar: "Labour"
+    theme: "labour"
+    impact: "high"
+    assets: ["UST", "USD", "Equities"]
+    higher_is: "good"
+    unit: "K"
+    ticker: "NFP TCH Index"          # VERIFY
+
+  - event: "US Unemployment Rate"
+    region: "US"
+    pillar: "Labour"
+    theme: "labour"
+    impact: "high"
+    assets: ["UST", "USD"]
+    higher_is: "bad"
+    unit: "%"
+    ticker: "USURTOT Index"          # VERIFY
+
+  - event: "US Retail Sales MoM"
+    region: "US"
+    pillar: "Consumption"
+    theme: "consumption"
+    impact: "medium"
+    assets: ["USD", "Equities"]
+    higher_is: "good"
+    unit: "%"
+    ticker: "RSTAMOM Index"          # VERIFY
+
+  - event: "US GDP QoQ Annualised"
+    region: "US"
+    pillar: "Growth"
+    theme: "growth"
+    impact: "high"
+    assets: ["UST", "USD", "Equities"]
+    higher_is: "good"
+    unit: "%"
+    ticker: "GDP CQOQ Index"         # VERIFY
+
+  - event: "UK GDP MoM"
+    region: "UK"
+    pillar: "Growth"
+    theme: "growth"
+    impact: "medium"
+    assets: ["Gilts", "GBP"]
+    higher_is: "good"
+    unit: "%"
+    ticker: "UKGDPMOM Index"         # VERIFY (Phase 1 ticker)
+
+  - event: "US Federal Funds Rate"
+    region: "US"
+    pillar: "Policy"
+    theme: "rate_policy"
+    impact: "high"
+    assets: ["UST", "USD", "Equities"]
+    higher_is: "hawkish"
+    unit: "%"
+    ticker: "FDTR Index"             # VERIFY
+
+  - event: "Bank of England Bank Rate"
+    region: "UK"
+    pillar: "Policy"
+    theme: "rate_policy"
+    impact: "high"
+    assets: ["Gilts", "GBP"]
+    higher_is: "hawkish"
+    unit: "%"
+    ticker: "UKBRBASE Index"         # VERIFY
+
+  - event: "ECB Deposit Facility Rate"
+    region: "Euro Area"
+    pillar: "Policy"
+    theme: "rate_policy"
+    impact: "high"
+    assets: ["Bunds", "EUR"]
+    higher_is: "hawkish"
+    unit: "%"
+    ticker: "EURR002W Index"         # VERIFY

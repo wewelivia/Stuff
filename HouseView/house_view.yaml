@@ -1,0 +1,100 @@
+# =============================================================================
+# HOUSE VIEW - Barclays Private Bank Mid-Year Outlook 2026: "Power Struggle"
+# =============================================================================
+# Source : Barclays Private Bank, Mid-Year Outlook (June 2026), "Power Struggle"
+#          privatebank.barclays.com/insights/mid-year-outlook-06-2026/
+# As of  : 2026-06-22
+#
+# NOTE ON FORMAT: drafted to a clean, obvious schema so it reads well on its own.
+# If your existing house_view.yaml uses different keys, paste it and I will pour
+# this content into your exact keys so the engine's scoring logic is untouched.
+#
+# Each theme carries:
+#   stance      - short directional label used as the house bias
+#   bias        - normalised direction the engine can score surprises against
+#   summary     - the view in plain terms, paraphrased from the outlook
+#   challenges_if / confirms_if - how an incoming print moves the verdict
+# =============================================================================
+
+meta:
+  title: "Power Struggle - Mid-Year Outlook 2026"
+  as_of: "2026-06-22"
+  source: "Barclays Private Bank Mid-Year Outlook, June 2026"
+  narrative: >
+    Markets are shaped by overlapping power struggles: US midterms and a possibly
+    divided Congress, a more multipolar geopolitical backdrop, K-shaped economies,
+    and energy constraints. The pivotal shock this half is the effective closure of
+    the Strait of Hormuz, which pushed oil and gas sharply higher, stalled the
+    disinflation trend and flipped the rates conversation from expected cuts toward
+    possible hikes. The backdrop is one of managed tension rather than outright
+    stress: growth is holding but momentum is weakening, and the direction of travel
+    matters more than any single point estimate.
+
+themes:
+
+  growth:
+    stance: resilient_but_slowing
+    bias: below_trend
+    summary: >
+      US growth slows but stays resilient, supported structurally by hyperscaler
+      capital spending. The euro area and the UK muddle through, with subdued
+      momentum from elevated energy prices, weak industrial activity and fragile
+      sentiment. China runs as a two-speed economy (healthy export manufacturing,
+      soft domestic services) around a ~4.5-5% GDP path, with property still a drag.
+    challenges_if: "growth surprises sharply lower (recessionary) or re-accelerates well above trend"
+    confirms_if: "growth softens at the margin while staying positive"
+
+  consumption:
+    stance: softening
+    bias: weakening
+    summary: >
+      Higher energy prices are weighing on consumer spending and business
+      confidence. In the UK, where sentiment had been the strongest since mid-2024,
+      retail sales and activity have turned softer as the energy shock bites.
+    challenges_if: "consumption prints come in firm/above consensus, signalling resilient demand"
+    confirms_if: "spending and retail data come in soft/below consensus"
+
+  inflation:
+    stance: sticky_upside
+    bias: above_target
+    summary: >
+      Inflation, thought largely under control at the start of the year, has had a
+      second wind from the energy shock. Headline is edging higher and services
+      inflation remains sticky; upside risks dominate while energy stays elevated.
+    challenges_if: "inflation surprises to the downside / disinflation resumes"
+    confirms_if: "headline or services inflation comes in hot/above consensus"
+
+  rate_policy:
+    stance: hold_to_hawkish
+    bias: easing_off_the_table
+    summary: >
+      The rates narrative has flipped from anticipated cuts to possible hikes.
+      Bank of England base case is to hold for the remainder of 2026, with a hike
+      later in the year not ruled out if the energy-driven inflation shock proves
+      persistent. In the US, a new Fed chair faces the task of lowering rates and
+      inflation while still supporting growth; the ECB's path is similarly
+      complicated. Cuts that markets had priced earlier in the year are gone.
+    challenges_if: "data pushes policy back toward cuts / dovish repricing"
+    confirms_if: "data supports hold-to-hawkish / hikes repricing"
+
+  sentiment:
+    stance: fragile
+    bias: cautious
+    summary: >
+      Business and consumer confidence have been dented by the energy shock and
+      layered political uncertainty. The distribution of risks is harder to read,
+      which argues for selectivity and adaptability over conviction in any single
+      point estimate.
+    challenges_if: "confidence/survey data rebounds firmly above consensus"
+    confirms_if: "survey and confidence data stay soft or deteriorate"
+
+  labour:
+    stance: TO_CONFIRM
+    bias: TO_CONFIRM
+    summary: >
+      The mid-year outlook does not state an explicit labour-market call in the
+      material reviewed, so this is left for you to set rather than inferred.
+      Implied tone from the broader narrative (US growth resilient but momentum
+      weakening) would be "resilient but cooling" - please confirm or overwrite.
+    challenges_if: "TBD - set once the labour stance is confirmed"
+    confirms_if: "TBD - set once the labour stance is confirmed"

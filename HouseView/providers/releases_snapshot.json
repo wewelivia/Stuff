@@ -1,0 +1,127 @@
+{
+  "_note": "Generated 23 Jun 2026 from current, sourced data. Released records carry a 'source'. Where a consensus or prior could not be verified this run it is null with a '_note' rather than guessed. Coverage this run: all high-impact inflation and rate-policy prints plus US labour, US/UK growth and US consumption. Not yet populated: sentiment surveys (ISM, Ifo) and some medium-impact UK detail - ask for a follow-up refresh to add them.",
+  "as_of": "2026-06-23",
+  "releases": [
+    {
+      "event": "US CPI YoY", "region": "US", "pillar": "Prices", "theme": "inflation",
+      "impact": "high", "assets": ["UST", "USD", "Equities"], "higher_is": "hawkish", "unit": "%",
+      "date": "10 Jun 2026", "date_iso": "2026-06-10",
+      "consensus": 4.2, "actual": 4.2, "previous": 3.8, "status": "Released",
+      "source": "BLS / CNBC, 10 Jun 2026 - headline CPI +4.2% YoY, in line with consensus (energy-led)"
+    },
+    {
+      "event": "US Core PCE YoY", "region": "US", "pillar": "Prices", "theme": "inflation",
+      "impact": "high", "assets": ["UST", "USD"], "higher_is": "hawkish", "unit": "%",
+      "date": "26 Jun 2026", "date_iso": "2026-06-26",
+      "consensus": null, "actual": null, "previous": null, "status": "Upcoming",
+      "source": null,
+      "_note": "May Core PCE due late June; April figure not verified this run"
+    },
+    {
+      "event": "US Non Farm Payrolls", "region": "US", "pillar": "Labour", "theme": "labour",
+      "impact": "high", "assets": ["UST", "USD", "Equities"], "higher_is": "good", "unit": "K",
+      "date": "05 Jun 2026", "date_iso": "2026-06-05",
+      "consensus": 85, "actual": 172, "previous": 179, "status": "Released",
+      "source": "BLS Employment Situation / Reuters (LSEG) poll ~85K; actual +172K",
+      "_note": "Consensus 80-88K across polls (Dow Jones 80K, LSEG 85K). April revised up to +179K"
+    },
+    {
+      "event": "US Unemployment Rate", "region": "US", "pillar": "Labour", "theme": "labour",
+      "impact": "high", "assets": ["UST", "USD"], "higher_is": "bad", "unit": "%",
+      "date": "05 Jun 2026", "date_iso": "2026-06-05",
+      "consensus": 4.3, "actual": 4.3, "previous": 4.3, "status": "Released",
+      "source": "BLS / CNBC - held at 4.3%, in line; third straight month steady"
+    },
+    {
+      "event": "US Retail Sales MoM", "region": "US", "pillar": "Consumption", "theme": "consumption",
+      "impact": "high", "assets": ["USD", "Equities"], "higher_is": "good", "unit": "%",
+      "date": "17 Jun 2026", "date_iso": "2026-06-17",
+      "consensus": 0.5, "actual": 0.9, "previous": 0.4, "status": "Released",
+      "source": "US Census Bureau / TD Economics - +0.9% MoM vs +0.5% expected (gasoline-led; control group +0.7%)"
+    },
+    {
+      "event": "US GDP QoQ Annualised", "region": "US", "pillar": "Growth", "theme": "growth",
+      "impact": "high", "assets": ["UST", "USD", "Equities"], "higher_is": "good", "unit": "%",
+      "date": "28 May 2026", "date_iso": "2026-05-28",
+      "consensus": null, "actual": 1.6, "previous": 0.5, "status": "Released",
+      "source": "BEA - Q1 2026 second estimate, 1.6% annualised (revised down from 2.0% advance; Q4 2025 was 0.5%)",
+      "_note": "Second estimate, no market consensus for revisions. Third estimate due 25 Jun 2026"
+    },
+    {
+      "event": "US Federal Funds Rate", "region": "US", "pillar": "Policy", "theme": "rate_policy",
+      "impact": "high", "assets": ["UST", "USD"], "higher_is": "hawkish", "unit": "%",
+      "date": "17 Jun 2026", "date_iso": "2026-06-17",
+      "consensus": 3.75, "actual": 3.75, "previous": 3.75, "status": "Released",
+      "source": "Federal Reserve / CNBC - held at 3.50-3.75% (upper bound 3.75%), unanimous 12-0, Warsh's first meeting",
+      "_note": "Hold widely expected; SEP dot plot flipped hawkish, median now implies a possible 2026 hike"
+    },
+    {
+      "event": "US CPI YoY", "region": "US", "pillar": "Prices", "theme": "inflation",
+      "impact": "high", "assets": ["UST", "USD", "Equities"], "higher_is": "hawkish", "unit": "%",
+      "date": "14 Jul 2026", "date_iso": "2026-07-14",
+      "consensus": null, "actual": null, "previous": 4.2, "status": "Upcoming",
+      "source": null
+    },
+    {
+      "event": "US Federal Funds Rate", "region": "US", "pillar": "Policy", "theme": "rate_policy",
+      "impact": "high", "assets": ["UST", "USD"], "higher_is": "hawkish", "unit": "%",
+      "date": "29 Jul 2026", "date_iso": "2026-07-29",
+      "consensus": null, "actual": null, "previous": 3.75, "status": "Upcoming",
+      "source": null
+    },
+    {
+      "event": "UK CPI YoY", "region": "UK", "pillar": "Prices", "theme": "inflation",
+      "impact": "high", "assets": ["Gilts", "GBP"], "higher_is": "hawkish", "unit": "%",
+      "date": "17 Jun 2026", "date_iso": "2026-06-17",
+      "consensus": 3.0, "actual": 2.8, "previous": 2.8, "status": "Released",
+      "source": "ONS / Reuters poll - held at 2.8%, below the 3.0% consensus (services inflation rose to 3.7%)",
+      "_note": "Below-consensus print; energy pass-through expected to lift inflation from Q3 as the Ofgem cap rises"
+    },
+    {
+      "event": "UK GDP MoM", "region": "UK", "pillar": "Growth", "theme": "growth",
+      "impact": "high", "assets": ["Gilts", "GBP"], "higher_is": "good", "unit": "%",
+      "date": "12 Jun 2026", "date_iso": "2026-06-12",
+      "consensus": null, "actual": -0.1, "previous": null, "status": "Released",
+      "source": "ONS - April 2026 monthly GDP -0.1%, first monthly contraction since Aug 2025 (services -0.2%)",
+      "_note": "Consensus and prior MoM not verified this run; 3m/3m growth was +0.7%"
+    },
+    {
+      "event": "Bank of England Bank Rate", "region": "UK", "pillar": "Policy", "theme": "rate_policy",
+      "impact": "high", "assets": ["Gilts", "GBP"], "higher_is": "hawkish", "unit": "%",
+      "date": "18 Jun 2026", "date_iso": "2026-06-18",
+      "consensus": 3.75, "actual": 3.75, "previous": 3.75, "status": "Released",
+      "source": "Bank of England - held at 3.75%, MPC voted 7-2 with two members favouring a hike to 4%",
+      "_note": "Hold expected; two dissents for a hike signal a hawkish lean"
+    },
+    {
+      "event": "Bank of England Bank Rate", "region": "UK", "pillar": "Policy", "theme": "rate_policy",
+      "impact": "high", "assets": ["Gilts", "GBP"], "higher_is": "hawkish", "unit": "%",
+      "date": "30 Jul 2026", "date_iso": "2026-07-30",
+      "consensus": null, "actual": null, "previous": 3.75, "status": "Upcoming",
+      "source": null
+    },
+    {
+      "event": "Euro Area CPI YoY Flash", "region": "Euro Area", "pillar": "Prices", "theme": "inflation",
+      "impact": "high", "assets": ["Bunds", "EUR"], "higher_is": "hawkish", "unit": "%",
+      "date": "03 Jun 2026", "date_iso": "2026-06-03",
+      "consensus": 3.2, "actual": 3.2, "previous": 3.0, "status": "Released",
+      "source": "Eurostat flash - HICP 3.2% YoY (April 3.0%); core rose to 2.5% from 2.2%",
+      "_note": "Highest since 2023; energy 10.9% YoY"
+    },
+    {
+      "event": "ECB Deposit Facility Rate", "region": "Euro Area", "pillar": "Policy", "theme": "rate_policy",
+      "impact": "high", "assets": ["Bunds", "EUR"], "higher_is": "hawkish", "unit": "%",
+      "date": "11 Jun 2026", "date_iso": "2026-06-11",
+      "consensus": 2.25, "actual": 2.25, "previous": 2.00, "status": "Released",
+      "source": "ECB / Euronews - raised 25bps to 2.25%, first hike since 2023, broadly expected (effective 17 Jun)",
+      "_note": "Staff now see 2026 headline inflation averaging 3.0%; markets price ~50% chance of a further hike by September"
+    },
+    {
+      "event": "ECB Deposit Facility Rate", "region": "Euro Area", "pillar": "Policy", "theme": "rate_policy",
+      "impact": "high", "assets": ["Bunds", "EUR"], "higher_is": "hawkish", "unit": "%",
+      "date": "23 Jul 2026", "date_iso": "2026-07-23",
+      "consensus": null, "actual": null, "previous": 2.25, "status": "Upcoming",
+      "source": null
+    }
+  ]
+}

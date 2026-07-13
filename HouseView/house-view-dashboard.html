@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>House View · Power Struggle</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel-2:#1b222c; --line:#232b36;
+    --ink:#e6edf3; --muted:#8b97a7; --faint:#5c6673;
+    --confirm:#3fb27f; --challenge:#e0603f; --tbd:#d1a24b; --pending:#4f8cc9;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --ui:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--ui);
+    font-size:14px;line-height:1.5}
+  .wrap{max-width:1000px;margin:0 auto;padding:28px 22px 64px}
+  header{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;
+    flex-wrap:wrap;border-bottom:1px solid var(--line);padding-bottom:18px}
+  .eyebrow{font-size:11px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--faint);font-weight:600}
+  h1{margin:4px 0 0;font-size:22px;font-weight:650;letter-spacing:-.01em}
+  nav a{font-size:12px;color:var(--muted);text-decoration:none;font-weight:600}
+  nav a:hover{color:var(--ink)}
+  .narrative{margin:22px 0 6px;padding:18px 20px;background:var(--panel);
+    border:1px solid var(--line);border-radius:12px;color:#cdd6e0;max-width:74ch}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:16px}
+  @media(max-width:720px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:16px 17px;position:relative;overflow:hidden}
+  .card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;
+    background:var(--faint)}
+  .card.set::before{background:var(--pending)}
+  .card.tbd::before{background:var(--tbd)}
+  .card h3{margin:0;font-size:14px;font-weight:650;text-transform:capitalize}
+  .stance{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:3px}
+  .bias{display:inline-block;margin-top:9px;font-size:10px;font-weight:700;
+    letter-spacing:.05em;text-transform:uppercase;padding:3px 8px;border-radius:5px;
+    color:var(--pending);border:1px solid color-mix(in oklab,var(--pending),transparent 65%)}
+  .bias.tbd{color:var(--tbd);border-color:color-mix(in oklab,var(--tbd),transparent 60%)}
+  .summary{margin-top:11px;color:#c4cdd8;font-size:13px}
+  .rule{margin-top:12px;display:grid;gap:6px}
+  .rule div{font-size:12px;color:var(--muted);display:flex;gap:8px}
+  .rule .k{font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+    min-width:76px;color:var(--faint)}
+  .rule .conf .k{color:var(--confirm)}
+  .rule .chal .k{color:var(--challenge)}
+  .state{padding:40px;text-align:center;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <span class="eyebrow">Barclays Private Bank · Mid-Year Outlook 2026</span>
+      <h1 id="title">House view</h1>
+    </div>
+    <nav><a href="/view-challenges.html">← View challenges</a></nav>
+  </header>
+
+  <div class="narrative" id="narrative">Loading…</div>
+  <div class="grid" id="grid"></div>
+</div>
+
+<script>
+const ORDER = ["growth","consumption","inflation","rate_policy","sentiment","labour"];
+async function load(){
+  let hv;
+  try{ hv = await (await fetch("/api/house-view",{cache:"no-store"})).json(); }
+  catch(e){ document.getElementById("narrative").innerHTML =
+    '<span style="color:var(--challenge)">Could not load the house view: '+e.message+'</span>'; return; }
+
+  const meta = hv.meta||{};
+  document.getElementById("title").textContent = meta.title || "House view";
+  document.getElementById("narrative").textContent =
+    (meta.narrative||"").trim() || "No narrative set.";
+
+  const themes = hv.themes||{};
+  const grid = document.getElementById("grid");
+  grid.innerHTML = "";
+  ORDER.forEach(name=>{
+    const t = themes[name]; if(!t) return;
+    const isTbd = (t.bias==="TO_CONFIRM" || t.stance==="TO_CONFIRM");
+    grid.insertAdjacentHTML("beforeend", `
+      <div class="card ${isTbd?'tbd':'set'}">
+        <h3>${name.replace(/_/g,' ')}</h3>
+        <div class="stance">${(t.stance||'—').replace(/_/g,' ')}</div>
+        <span class="bias ${isTbd?'tbd':''}">${(t.bias||'—').replace(/_/g,' ')}</span>
+        <div class="summary">${(t.summary||'').trim()}</div>
+        <div class="rule">
+          <div class="conf"><span class="k">Confirms</span><span>${(t.confirms_if||'—').trim()}</span></div>
+          <div class="chal"><span class="k">Challenges</span><span>${(t.challenges_if||'—').trim()}</span></div>
+        </div>
+      </div>`);
+  });
+  if(!grid.children.length) grid.innerHTML = '<div class="state">No themes defined.</div>';
+}
+load();
+</script>
+</body>
+</html>

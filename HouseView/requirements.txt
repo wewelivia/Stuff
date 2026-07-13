@@ -1,0 +1,14 @@
+# Core app (installs on both Mac and the work PC via normal pip)
+fastapi>=0.110
+uvicorn[standard]>=0.27
+PyYAML>=6.0
+
+# NOTE on blpapi (work PC only) -------------------------------------------------
+# blpapi is NOT a normal PyPI package. Do not add "blpapi" to this file; a plain
+# `pip install blpapi` will fail or grab the wrong thing. On the Bloomberg PC:
+#
+#   pip install --index-url https://blpapi.bloomberg.com/repository/releases/python/simple/ blpapi
+#
+# The C++ SDK also needs to be present (the Terminal install usually provides it;
+# if not, set BLPAPI_ROOT to the SDK path). The Mac does not need blpapi at all,
+# it runs provider_mode: snapshot.

@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>House View · View Challenges</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel-2:#1b222c; --line:#232b36;
+    --ink:#e6edf3; --muted:#8b97a7; --faint:#5c6673;
+    --confirm:#3fb27f; --challenge:#e0603f; --inline:#7c8798;
+    --pending:#4f8cc9; --tbd:#d1a24b;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --ui:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--ui);
+    font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  a{color:inherit}
+  .wrap{max-width:1180px;margin:0 auto;padding:28px 22px 64px}
+
+  header{display:flex;align-items:flex-end;justify-content:space-between;
+    gap:18px;flex-wrap:wrap;border-bottom:1px solid var(--line);padding-bottom:18px}
+  .title{display:flex;flex-direction:column;gap:4px}
+  .eyebrow{font-size:11px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--faint);font-weight:600}
+  h1{margin:0;font-size:22px;font-weight:650;letter-spacing:-.01em}
+  .meta{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .pill{font-size:11px;font-weight:600;letter-spacing:.04em;padding:4px 9px;
+    border-radius:999px;border:1px solid var(--line);color:var(--muted);
+    font-family:var(--mono)}
+  .pill.live{color:var(--confirm);border-color:color-mix(in oklab,var(--confirm),transparent 55%)}
+  .pill.snap{color:var(--pending);border-color:color-mix(in oklab,var(--pending),transparent 55%)}
+  .btn{cursor:pointer;font-family:var(--ui);font-size:13px;font-weight:600;
+    color:var(--ink);background:var(--panel-2);border:1px solid var(--line);
+    padding:7px 13px;border-radius:8px}
+  .btn:hover{border-color:var(--faint)}
+  .btn:focus-visible{outline:2px solid var(--pending);outline-offset:2px}
+  nav a{font-size:12px;color:var(--muted);text-decoration:none;font-weight:600}
+  nav a:hover{color:var(--ink)}
+
+  /* theme rail */
+  .rail{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin:22px 0 8px}
+  @media(max-width:900px){.rail{grid-template-columns:repeat(3,1fr)}}
+  @media(max-width:560px){.rail{grid-template-columns:repeat(2,1fr)}}
+  .theme{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:12px 12px 11px;position:relative;overflow:hidden}
+  .theme::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--faint)}
+  .theme.supported::before{background:var(--confirm)}
+  .theme.pressure::before{background:var(--challenge)}
+  .theme.mixed::before{background:var(--tbd)}
+  .theme.tbd::before{background:var(--faint)}
+  .theme .name{font-size:12px;font-weight:650;letter-spacing:.02em}
+  .theme .stance{font-size:11px;color:var(--muted);margin-top:2px;
+    text-transform:capitalize}
+  .theme .verdict{margin-top:9px;font-size:11px;font-weight:700;letter-spacing:.03em;
+    text-transform:uppercase}
+  .theme .tally{font-family:var(--mono);font-size:11px;color:var(--faint);margin-top:3px}
+  .supported .verdict{color:var(--confirm)}
+  .pressure .verdict{color:var(--challenge)}
+  .mixed .verdict{color:var(--tbd)}
+  .tbd .verdict{color:var(--faint)}
+
+  /* table */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    margin-top:20px;overflow:hidden}
+  .card h2{margin:0;padding:14px 16px;font-size:12px;font-weight:650;
+    letter-spacing:.12em;text-transform:uppercase;color:var(--muted);
+    border-bottom:1px solid var(--line)}
+  table{width:100%;border-collapse:collapse}
+  thead th{font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--faint);font-weight:600;text-align:right;padding:9px 14px;
+    border-bottom:1px solid var(--line)}
+  thead th.l{text-align:left}
+  tbody td{padding:11px 14px;border-bottom:1px solid var(--line);
+    font-family:var(--mono);font-size:13px;text-align:right;white-space:nowrap}
+  tbody td.l{text-align:left;font-family:var(--ui)}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:var(--panel-2)}
+  .ev{font-weight:600}
+  .sub{color:var(--faint);font-size:11px;font-family:var(--mono)}
+  .surp.pos{color:var(--confirm)}
+  .surp.neg{color:var(--challenge)}
+  .v{display:inline-block;min-width:96px;text-align:center;font-family:var(--ui);
+    font-size:11px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;
+    padding:4px 8px;border-radius:6px;border:1px solid transparent}
+  .v.confirms{color:var(--confirm);border-color:color-mix(in oklab,var(--confirm),transparent 65%);
+    background:color-mix(in oklab,var(--confirm),transparent 90%)}
+  .v.challenges{color:var(--challenge);border-color:color-mix(in oklab,var(--challenge),transparent 65%);
+    background:color-mix(in oklab,var(--challenge),transparent 90%)}
+  .v.inline{color:var(--inline);border-color:color-mix(in oklab,var(--inline),transparent 65%)}
+  .v.pending{color:var(--pending);border-color:color-mix(in oklab,var(--pending),transparent 65%)}
+  .v.unscored,.v.noconsensus{color:var(--tbd);border-color:color-mix(in oklab,var(--tbd),transparent 65%)}
+
+  .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:14px;font-size:11px;
+    color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .dot{width:9px;height:9px;border-radius:2px;display:inline-block}
+  .foot{margin-top:20px;font-size:11px;color:var(--faint);line-height:1.6}
+  .state{padding:40px 16px;text-align:center;color:var(--muted)}
+  .err{color:var(--challenge)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="title">
+      <span class="eyebrow">Barclays Private Bank · Power Struggle</span>
+      <h1>View Challenges</h1>
+    </div>
+    <div class="meta">
+      <span class="pill" id="mode">provider …</span>
+      <span class="pill" id="asof">as of …</span>
+      <nav><a href="/house-view-dashboard.html">House view →</a></nav>
+      <button class="btn" id="refresh">Refresh</button>
+    </div>
+  </header>
+
+  <section class="rail" id="rail" aria-label="Theme roll-up"></section>
+
+  <div class="card">
+    <h2>Releases scored against the house view</h2>
+    <div id="tableHost">
+      <div class="state">Loading releases…</div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><i class="dot" style="background:var(--confirm)"></i>Confirms the house view</span>
+    <span><i class="dot" style="background:var(--challenge)"></i>Challenges it</span>
+    <span><i class="dot" style="background:var(--inline)"></i>In line with consensus</span>
+    <span><i class="dot" style="background:var(--pending)"></i>Not yet released</span>
+    <span><i class="dot" style="background:var(--tbd)"></i>Unscored / no consensus</span>
+  </div>
+
+  <p class="foot" id="foot"></p>
+</div>
+
+<script>
+const THEME_ORDER = ["growth","consumption","inflation","rate_policy","sentiment","labour"];
+const THEME_LABEL = {growth:"Growth",consumption:"Consumption",inflation:"Inflation",
+  rate_policy:"Rate policy",sentiment:"Sentiment",labour:"Labour"};
+
+const railClass = v => v==="Supported"?"supported":v==="Under pressure"?"pressure":
+  (v==="Mixed"?"mixed":"tbd");
+const vClass = v => (v||"").toLowerCase().replace(/\s+/g,"");
+
+function fmt(x, unit){
+  if(x===null||x===undefined||x==="") return "·";
+  const n = Number(x);
+  if(Number.isNaN(n)) return String(x);
+  const s = (unit==="K") ? n.toLocaleString() : n.toFixed(unit==="%"?1:2);
+  return unit==="%" ? s+"%" : s;
+}
+function surpCell(r){
+  if(r.surprise===null||r.surprise===undefined) return '<td class="sub">·</td>';
+  const n = Number(r.surprise);
+  const sign = n>0?"+":"";
+  const cls = n>0?"pos":(n<0?"neg":"");
+  const u = r.unit==="%"?"":"";
+  return `<td class="surp ${cls}">${sign}${n.toFixed(2)}${r.unit==="%"?" pp":""}</td>`;
+}
+
+async function load(){
+  const host = document.getElementById("tableHost");
+  host.innerHTML = '<div class="state">Loading releases…</div>';
+  let data;
+  try{
+    const res = await fetch("/api/view-challenges", {cache:"no-store"});
+    data = await res.json();
+    if(data.error) throw new Error(data.error);
+  }catch(e){
+    host.innerHTML = `<div class="state err">Could not load data: ${e.message}</div>`;
+    return;
+  }
+
+  // mode + as_of
+  const mode = data.provider_mode || "?";
+  const modeEl = document.getElementById("mode");
+  modeEl.textContent = mode==="blpapi" ? "Bloomberg · live" : "snapshot";
+  modeEl.className = "pill " + (mode==="blpapi" ? "live" : "snap");
+  document.getElementById("asof").textContent = "as of " + (data.as_of || "unknown");
+
+  // theme rail
+  const rail = document.getElementById("rail");
+  rail.innerHTML = "";
+  THEME_ORDER.forEach(t=>{
+    const th = (data.themes||{})[t] || {};
+    const verdict = th.verdict || "Awaiting data";
+    const cls = railClass(verdict);
+    const tally = th.confirms!==undefined
+      ? `${th.confirms}✓ · ${th.challenges}✗ · ${th.in_line||0}=`
+      : "";
+    const stance = (th.stance||"—").replace(/_/g," ");
+    rail.insertAdjacentHTML("beforeend",
+      `<div class="theme ${cls}">
+        <div class="name">${THEME_LABEL[t]||t}</div>
+        <div class="stance">${stance}</div>
+        <div class="verdict">${verdict}</div>
+        <div class="tally">${tally}</div>
+      </div>`);
+  });
+
+  // table
+  const rows = (data.releases||[]).slice().sort((a,b)=>
+    (b.date_iso||"").localeCompare(a.date_iso||""));
+  if(!rows.length){
+    host.innerHTML = '<div class="state">No releases in the current dataset.</div>';
+    return;
+  }
+  let html = `<table><thead><tr>
+      <th class="l">Date</th><th class="l">Event</th><th class="l">Region</th>
+      <th>Actual</th><th>Cons.</th><th>Prev.</th><th>Surprise</th>
+      <th class="l" style="text-align:center">Verdict</th></tr></thead><tbody>`;
+  rows.forEach(r=>{
+    const v = r.verdict || "—";
+    html += `<tr>
+      <td class="l sub">${r.date || (r.date_iso||"")}</td>
+      <td class="l"><span class="ev">${r.event||""}</span>
+          <div class="sub">${THEME_LABEL[r.theme]||r.theme||""}</div></td>
+      <td class="l sub">${r.region||""}</td>
+      <td>${fmt(r.actual, r.unit)}</td>
+      <td>${fmt(r.consensus, r.unit)}</td>
+      <td>${fmt(r.previous, r.unit)}</td>
+      ${surpCell(r)}
+      <td style="text-align:center"><span class="v ${vClass(v)}" title="${r.verdict_note||''}">${v}</span></td>
+    </tr>`;
+  });
+  html += "</tbody></table>";
+  host.innerHTML = html;
+
+  document.getElementById("foot").textContent = data.provider_mode==="snapshot"
+    ? "Snapshot data, as current as the last refresh (" + (data.as_of||"?") + "). Ask Claude to refresh the House View snapshot for newer prints."
+    : "Live Bloomberg data via the Terminal.";
+}
+
+document.getElementById("refresh").addEventListener("click", load);
+load();
+</script>
+</body>
+</html>
