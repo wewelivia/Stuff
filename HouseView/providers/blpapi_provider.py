@@ -214,19 +214,33 @@ class BlpapiProvider(MockProvider):
         hist = self._history(session, svc, ticker,
                              [f["actual_hist"], f["consensus_hist"]], start, end)
 
-        # 2. Reference: publish dates + next scheduled release.
+        # 2. Reference: publish dates + next scheduled release. The overrides are
+        #    essential: without them the release-date list is future-only.
+        fwd_end = (today + _dt.timedelta(days=self.window_fwd)).strftime("%Y%m%d")
         ref = self._reference(session, svc, ticker,
-                              [f["release_date_list"], f["next_release"]])
+                              [f["release_date_list"], f["next_release"]],
+                              overrides={"START_DT": start, "END_DT": fwd_end})
 
         publish_dates = sorted(
             d for d in (_to_iso(x) for x in (ref.get(f["release_date_list"]) or []))
             if d
         )
 
+        # 3. Same-day series (policy rates): the print IS the decision, so the
+        #    history date and the publish date are the same day. PX_LAST daily
+        #    history returns a row for EVERY calendar day the rate was in force,
+        #    so without this filter one policy rate floods the window with ~120
+        #    identical rows. Keep only the days a decision actually happened.
+        if entry.get("same_day"):
+            pub_set = set(publish_dates)
+            hist = [r for r in hist if r.get("date") in pub_set]
+            pub_map = {r["date"]: r["date"] for r in hist if r.get("date")}
+        else:
+            period_ends = [r.get("date") for r in hist if r.get("date")]
+            pub_map = self._map_publish_dates(period_ends, publish_dates)
+
         records = []
         prev_actual = None
-        period_ends = [r.get("date") for r in hist if r.get("date")]
-        pub_map = self._map_publish_dates(period_ends, publish_dates)
 
         for row in hist:                       # ascending by period end
             period_end = row.get("date")
@@ -359,12 +373,23 @@ class BlpapiProvider(MockProvider):
         rows.sort(key=lambda r: r.get("date") or "")
         return rows
 
-    def _reference(self, session, svc, ticker, fields):
+    def _reference(self, session, svc, ticker, fields, overrides=None):
         """ReferenceDataRequest -> {FIELD: value}; arrays become Python lists."""
         req = svc.createRequest("ReferenceDataRequest")
         req.append("securities", ticker)
         for f in fields:
             req.append("fields", f)
+
+        # ECO_FUTURE_RELEASE_DATE_LIST lives up to its name: without overrides it
+        # returns FUTURE dates only. Historical prints then get stamped with future
+        # publish dates and vanish from the window. START_DT/END_DT widen it to cover
+        # the lookback too. This is the Phase 1 behaviour; dropping it was a regression.
+        if overrides:
+            ov_el = req.getElement("overrides")
+            for name, val in overrides.items():
+                ov = ov_el.appendElement()
+                ov.setElement("fieldId", name)
+                ov.setElement("value", val)
 
         session.sendRequest(req)
         out = {}
