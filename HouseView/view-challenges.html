@@ -237,7 +237,11 @@ async function load(){
                  daysBetween(data.as_of, w.today) > (w.lookback_days ?? 10));
   const awaiting = all.filter(r=>r.verdict==="Awaiting print").length;
 
-  if(stale){
+  if(data.fetch_error){
+    notice.innerHTML = `<div class="banner"><b>Live Bloomberg pull failed.</b>
+      ${data.fetch_error}<br>
+      <span class="cd">Showing snapshot data as a fallback, so anything below is not live.</span></div>`;
+  } else if(stale){
     notice.innerHTML = `<div class="banner"><b>Data is older than the window.</b>
       The snapshot is dated ${data.as_of}, which is ${daysBetween(data.as_of, w.today)} days ago,
       so a ${w.lookback_days}-day lookback finds little or nothing. Refresh the snapshot,

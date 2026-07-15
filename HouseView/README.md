@@ -49,6 +49,28 @@ setting the environment variable `HV_PROVIDER_MODE=blpapi`.
    python -m providers.blpapi_provider
    ```
 
+## The display window
+
+The dashboard is scoped to a rolling window, set in `config.yaml`:
+
+```yaml
+window:
+  lookback_days: 10     # score prints from the last 10 days
+  lookahead_days: 5     # flag prints due in the next 5 days
+```
+
+Anything outside is hidden. The page splits into two sections: what landed and how it
+scored, then what is due and what would dent the view.
+
+Status is derived from the date, not read from the data. A print with a number is
+Released; no number and a future date is Upcoming; no number and a date that has
+passed is **Awaiting print**, which means the data is stale or the Bloomberg field
+came back blank. That state exists so a missing number is never silently mislabelled
+as "upcoming".
+
+A 10-day window is a small evidence base. Two quiet weeks and most themes read
+"Awaiting data". Widen `lookback_days` (30 or 45) if the roll-up looks too thin.
+
 ## How the scoring works
 
 For each released print with a consensus: `surprise = actual - consensus`. The
@@ -72,6 +94,7 @@ HouseView/
   requirements.txt
   start.command / start.bat   launchers
   README.md / REFRESH.md / SETUP-GIT.md / copilot_refresh_prompt.md
+  diagnose_bbg.py             Bloomberg field/ticker diagnostic
   providers/
     mock_provider.py          base class (the contract)
     snapshot_provider.py      offline snapshot
@@ -86,6 +109,10 @@ HouseView/
 - `sentiment` has no releases in the current snapshot; add ISM / Ifo on the next
   refresh to light it up.
 - The Bloomberg tickers and fields in `config.yaml` are placeholders. Verify before
-  a live run.
+  a live run. `python diagnose_bbg.py` prints exactly what Bloomberg returns for each
+  ticker and field, and says which mnemonics came back empty.
+- The bundled snapshot is dated 23 June 2026. Against a 10-day window it is stale and
+  the dashboard will look nearly empty. Run blpapi mode on the work PC, or refresh the
+  snapshot (REFRESH.md).
 
 See SETUP-GIT.md to push this to GitHub and pull it on the work PC.

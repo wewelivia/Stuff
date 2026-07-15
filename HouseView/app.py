@@ -87,6 +87,9 @@ def build_challenges() -> dict:
     result["as_of"] = as_of
     result["provider_mode"] = mode
     result["meta"] = house_view.get("meta", {})
+    err = getattr(provider, "fetch_error", None)
+    if err:
+        result["fetch_error"] = err
     result["window"] = {
         "lookback_days": lookback,
         "lookahead_days": lookahead,

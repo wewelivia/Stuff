@@ -14,6 +14,15 @@
 
 provider_mode: snapshot
 
+# ---- Display window ---------------------------------------------------------
+# The dashboard scope: score prints from the last `lookback_days` and flag prints
+# due in the next `lookahead_days`. Anything outside is hidden.
+# Widen lookback_days if the theme roll-up looks too thin (a 10-day window is a
+# small evidence base: a couple of quiet weeks and most themes read "Awaiting data").
+window:
+  lookback_days: 10
+  lookahead_days: 5
+
 # ---- Snapshot (Mac / offline) ----------------------------------------------
 snapshot:
   path: providers/releases_snapshot.json
@@ -26,13 +35,17 @@ blpapi:
   window_back_days: 120
   window_fwd_days: 45
   snapshot_fallback: providers/releases_snapshot.json   # used if Terminal is closed
-  # VERIFY every mnemonic against your real tickers with FLDS<GO> before a live run.
+  # VERIFIED against the Terminal by diagnose_bbg.py (July 2026).
+  # The actual is NOT a reference field on economic-release securities: it lives in
+  # history, keyed to the period-end date. BN_SURVEY_MEDIAN historises on the same
+  # key, which is what makes scoring past surprises possible. `previous` needs no
+  # field at all, it is the prior row of PX_LAST history.
+  # ACTUAL_RELEASE / PREVIOUS_VALUE / ECO_RELEASE_PERIOD_END_DATE do not exist.
   fields:
-    release_date_list: ECO_FUTURE_RELEASE_DATE_LIST
-    consensus: BN_SURVEY_MEDIAN
-    actual: ACTUAL_RELEASE
-    previous: PREVIOUS_VALUE
-    period_end: ECO_RELEASE_PERIOD_END_DATE
+    actual_hist: PX_LAST                                # historical: the print
+    consensus_hist: BN_SURVEY_MEDIAN                    # historical: the survey
+    release_date_list: ECO_FUTURE_RELEASE_DATE_LIST     # reference: publish dates
+    next_release: ECO_RELEASE_DT                        # reference: next release
 
 # =============================================================================
 # RELEASE UNIVERSE
@@ -137,7 +150,7 @@ releases:
     assets: ["Gilts", "GBP"]
     higher_is: "good"
     unit: "%"
-    ticker: "UKGDPMOM Index"         # VERIFY (Phase 1 ticker)
+    ticker: "UKGDM3M Index"          # your fix. NOTE: 3M/3M, not MoM - see README
 
   - event: "US Federal Funds Rate"
     region: "US"
