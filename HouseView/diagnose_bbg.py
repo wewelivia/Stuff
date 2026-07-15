@@ -1,20 +1,27 @@
 """
-diagnose_bbg.py - show exactly what Bloomberg returns for each configured ticker.
+diagnose_bbg.py - find out which Bloomberg fields actually work on YOUR tickers.
 
-WHY
----
-When every release shows "Awaiting print" in blpapi mode, the cause is almost always
-one of: the Terminal is not running, the ticker is wrong, or the field mnemonic does
-not exist for that ticker family. The dashboard cannot tell you which. This can.
+WHY THIS VERSION
+----------------
+Run 1 proved the tickers are fine, and that ACTUAL_RELEASE / PREVIOUS_VALUE /
+ECO_RELEASE_PERIOD_END_DATE do not exist as snapshot fields on economic-release
+securities. That matches the Phase 1 finding: the actual is not a reference field,
+it lives in HISTORY keyed to the period-end date.
+
+So this script now does two things:
+
+  PART 1  Probe CANDIDATE reference fields per role and report which resolve.
+          No guessing: the Terminal tells us the answer.
+
+  PART 2  Test the HISTORICAL path (HistoricalDataRequest on PX_LAST and on
+          BN_SURVEY_MEDIAN). This is the proposed source of actuals, previous
+          and period-end. Part 2 is the one that matters.
 
 RUN
 ---
     python diagnose_bbg.py
 
-It prints, per ticker, whether the security resolved and what each field returned,
-then a summary of which fields came back empty across the board (a field that is
-blank for EVERY ticker is a wrong mnemonic; a field blank for ONE ticker is usually
-a wrong ticker).
+Paste the output back and the provider gets wired to whatever actually works.
 """
 
 from __future__ import annotations
@@ -31,10 +38,40 @@ try:
     import blpapi
 except ImportError:
     print("blpapi is not installed in this Python environment.\n")
-    print("Install it from Bloomberg's own index (it is not on normal PyPI):")
     print("  pip install --index-url "
           "https://blpapi.bloomberg.com/repository/releases/python/simple/ blpapi")
     sys.exit(1)
+
+
+# Candidate reference fields to probe, grouped by the role we need filled.
+# BN_SURVEY_MEDIAN and ECO_FUTURE_RELEASE_DATE_LIST are known-good from run 1
+# and act as controls: if they fail here, something else is wrong.
+CANDIDATES = {
+    "actual (reference)": [
+        "PX_LAST",
+        "LAST_PRICE",
+        "BN_SURVEY_ACTUAL",
+        "ECO_RELEASE_ACTUAL",
+    ],
+    "previous (reference)": [
+        "PX_YEST_CLOSE",
+        "BN_SURVEY_PREVIOUS",
+        "ECO_RELEASE_PRIOR",
+    ],
+    "period end / release date": [
+        "ECO_RELEASE_DT",
+        "LATEST_ANNOUNCEMENT_DT",
+        "LAST_UPDATE_DT",
+    ],
+    "controls (known good)": [
+        "BN_SURVEY_MEDIAN",
+        "ECO_FUTURE_RELEASE_DATE_LIST",
+    ],
+}
+
+# Probing every ticker with ~13 fields is slow and noisy. Three representative
+# securities prove the point.
+PROBE_LIMIT = 3
 
 
 def load_config():
@@ -42,125 +79,165 @@ def load_config():
         return yaml.safe_load(fh) or {}
 
 
-def main():
-    cfg = load_config()
-    blp = cfg.get("blpapi", {}) or {}
-    fields = blp.get("fields", {}) or {}
-    ticker_key = blp.get("ticker_key", "ticker")
-    releases = cfg.get("releases", []) or []
-
-    field_list = [
-        fields.get("consensus", "BN_SURVEY_MEDIAN"),
-        fields.get("actual", "ACTUAL_RELEASE"),
-        fields.get("previous", "PREVIOUS_VALUE"),
-        fields.get("period_end", "ECO_RELEASE_PERIOD_END_DATE"),
-        fields.get("release_date_list", "ECO_FUTURE_RELEASE_DATE_LIST"),
-    ]
-
-    host = blp.get("host", "localhost")
-    port = int(blp.get("port", 8194))
-
-    print(f"Connecting to Bloomberg at {host}:{port} ...")
+def open_session(host, port):
     opts = blpapi.SessionOptions()
     opts.setServerHost(host)
     opts.setServerPort(port)
-    session = blpapi.Session(opts)
-    if not session.start():
-        print("\nFAILED: could not start a blpapi session.")
-        print("Check the Terminal is running and you are logged in on this machine.")
-        return
-    if not session.openService("//blp/refdata"):
-        print("\nFAILED: could not open //blp/refdata.")
-        return
-    print("Connected.\n")
+    s = blpapi.Session(opts)
+    if not s.start():
+        print("FAILED: could not start a blpapi session. Is the Terminal running?")
+        return None
+    if not s.openService("//blp/refdata"):
+        print("FAILED: could not open //blp/refdata.")
+        return None
+    return s
 
-    svc = session.getService("//blp/refdata")
-    today = dt.date.today()
-    start = (today - dt.timedelta(days=int(blp.get("window_back_days", 120)))).strftime("%Y%m%d")
-    end = (today + dt.timedelta(days=int(blp.get("window_fwd_days", 45)))).strftime("%Y%m%d")
 
-    empty_counts = {f: 0 for f in field_list}
-    bad_tickers = []
-    n = 0
+def drain(session):
+    """Collect all messages until RESPONSE."""
+    msgs = []
+    while True:
+        ev = session.nextEvent(10000)
+        for m in ev:
+            msgs.append(m)
+        if ev.eventType() == blpapi.Event.RESPONSE:
+            break
+    return msgs
 
-    for entry in releases:
-        ticker = entry.get(ticker_key) or entry.get("bbg_ticker")
-        if not ticker:
-            continue
-        n += 1
+
+def probe_reference(session, svc, tickers):
+    print("=" * 70)
+    print("PART 1 - which REFERENCE fields resolve?")
+    print("=" * 70)
+
+    all_fields = [f for group in CANDIDATES.values() for f in group]
+
+    for ticker in tickers:
+        print(f"\n  {ticker}")
         req = svc.createRequest("ReferenceDataRequest")
         req.append("securities", ticker)
-        for f in field_list:
+        for f in all_fields:
             req.append("fields", f)
-        for name, val in (("START_DT", start), ("END_DT", end)):
-            ov = req.getElement("overrides").appendElement()
-            ov.setElement("fieldId", name)
-            ov.setElement("value", val)
 
         session.sendRequest(req)
-        got = {}
-        err = None
-        while True:
-            ev = session.nextEvent(5000)
-            for msg in ev:
+        valid, invalid = {}, set()
+        for msg in drain(session):
+            if not msg.hasElement("securityData"):
+                continue
+            secs = msg.getElement("securityData")
+            for i in range(secs.numValues()):
+                sd = secs.getValueAsElement(i)
+                if sd.hasElement("securityError"):
+                    print("      SECURITY ERROR")
+                    continue
+                if sd.hasElement("fieldExceptions"):
+                    fx = sd.getElement("fieldExceptions")
+                    for k in range(fx.numValues()):
+                        invalid.add(fx.getValueAsElement(k).getElementAsString("fieldId"))
+                fd = sd.getElement("fieldData")
+                for j in range(fd.numElements()):
+                    el = fd.getElement(j)
+                    valid[str(el.name())] = (f"<{el.numValues()} values>"
+                                             if el.isArray() else el.getValue())
+
+        for role, fields in CANDIDATES.items():
+            print(f"      {role}:")
+            for f in fields:
+                if f in valid:
+                    print(f"          OK      {f:<32} {valid[f]}")
+                elif f in invalid:
+                    print(f"          invalid {f}")
+                else:
+                    print(f"          empty   {f}")
+
+
+def probe_history(session, svc, tickers, back_days):
+    print("\n" + "=" * 70)
+    print("PART 2 - the HISTORICAL path (this is the one that matters)")
+    print("=" * 70)
+    print("If PX_LAST history returns rows, that is our source of actuals,")
+    print("previous and period-end dates, and 3 broken fields become unnecessary.")
+    print("If BN_SURVEY_MEDIAN history returns rows, we can score PAST surprises.")
+    print("If it does not, only the NEXT release can be scored against consensus.\n")
+
+    today = dt.date.today()
+    start = (today - dt.timedelta(days=back_days)).strftime("%Y%m%d")
+    end = today.strftime("%Y%m%d")
+
+    for ticker in tickers:
+        print(f"  {ticker}   ({start} .. {end})")
+        for field in ("PX_LAST", "BN_SURVEY_MEDIAN"):
+            req = svc.createRequest("HistoricalDataRequest")
+            req.append("securities", ticker)
+            req.append("fields", field)
+            req.set("startDate", start)
+            req.set("endDate", end)
+            req.set("periodicitySelection", "DAILY")
+
+            session.sendRequest(req)
+            rows, err = [], None
+            for msg in drain(session):
                 if not msg.hasElement("securityData"):
                     continue
-                secs = msg.getElement("securityData")
-                for i in range(secs.numValues()):
-                    sd = secs.getValueAsElement(i)
-                    if sd.hasElement("securityError"):
-                        err = str(sd.getElement("securityError").getElementAsString("message"))
-                        continue
-                    if sd.hasElement("fieldExceptions"):
-                        fx = sd.getElement("fieldExceptions")
-                        for k in range(fx.numValues()):
-                            fe = fx.getValueAsElement(k)
-                            fid = fe.getElementAsString("fieldId")
-                            got[fid] = "<FIELD NOT VALID>"
-                    fd = sd.getElement("fieldData")
-                    for j in range(fd.numElements()):
-                        el = fd.getElement(j)
-                        name = str(el.name())
-                        if el.isArray():
-                            got[name] = f"<{el.numValues()} values>"
-                        else:
-                            got[name] = el.getValue()
-            if ev.eventType() == blpapi.Event.RESPONSE:
-                break
+                sd = msg.getElement("securityData")
+                if sd.hasElement("securityError"):
+                    err = "security error"
+                    continue
+                if sd.hasElement("fieldExceptions") and sd.getElement("fieldExceptions").numValues():
+                    err = "FIELD NOT VALID for history"
+                    continue
+                fdarr = sd.getElement("fieldData")
+                for i in range(fdarr.numValues()):
+                    row = fdarr.getValueAsElement(i)
+                    d = row.getElementAsDatetime("date") if row.hasElement("date") else None
+                    v = row.getElement(field).getValue() if row.hasElement(field) else None
+                    rows.append((str(d)[:10], v))
 
-        label = f"{entry.get('event','?')}  [{ticker}]"
-        if err:
-            print(f"  {label}\n      SECURITY ERROR: {err}")
-            bad_tickers.append(ticker)
-            continue
-        print(f"  {label}")
-        for f in field_list:
-            v = got.get(f, None)
-            mark = "ok " if v not in (None, "", "<FIELD NOT VALID>") else "-- "
-            if v in (None, ""):
-                empty_counts[f] += 1
-                v = "<empty>"
-            print(f"      {mark}{f:<34} {v}")
+            if err:
+                print(f"      {field:<20} {err}")
+            elif not rows:
+                print(f"      {field:<20} no rows returned")
+            else:
+                print(f"      {field:<20} {len(rows)} rows   e.g. " +
+                      ", ".join(f"{d}={v}" for d, v in rows[-3:]))
         print()
 
-    session.stop()
 
-    print("=" * 64)
-    print(f"Checked {n} tickers.\n")
-    if bad_tickers:
-        print("Tickers Bloomberg did not recognise (fix these in config.yaml):")
-        for t in bad_tickers:
-            print(f"  - {t}")
-        print()
-    for f, c in empty_counts.items():
-        if c == n and n:
-            print(f"  {f}: empty for EVERY ticker -> the mnemonic is probably wrong. "
-                  f"Check FLDS<GO> on one of these securities.")
-        elif c:
-            print(f"  {f}: empty for {c} of {n} tickers -> likely those tickers, not the field.")
-    if not bad_tickers and not any(empty_counts.values()):
-        print("Everything resolved. If the dashboard still looks wrong, the issue is "
-              "downstream of Bloomberg.")
+def main():
+    cfg = load_config()
+    blp = cfg.get("blpapi", {}) or {}
+    ticker_key = blp.get("ticker_key", "ticker")
+    releases = cfg.get("releases", []) or []
+    back_days = int(blp.get("window_back_days", 120))
+
+    tickers = []
+    for e in releases:
+        t = e.get(ticker_key) or e.get("bbg_ticker")
+        if t and t not in tickers:
+            tickers.append(t)
+    tickers = tickers[:PROBE_LIMIT]
+
+    if not tickers:
+        print("No tickers found in config.yaml.")
+        return
+
+    host, port = blp.get("host", "localhost"), int(blp.get("port", 8194))
+    print(f"Connecting to Bloomberg at {host}:{port} ...")
+    session = open_session(host, port)
+    if session is None:
+        return
+    print(f"Connected. Probing {len(tickers)} representative tickers.\n")
+    svc = session.getService("//blp/refdata")
+
+    try:
+        probe_reference(session, svc, tickers)
+        probe_history(session, svc, tickers, back_days)
+    finally:
+        session.stop()
+
+    print("=" * 70)
+    print("Paste this output back and the provider gets wired to what works.")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
