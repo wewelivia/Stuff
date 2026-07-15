@@ -135,17 +135,23 @@ class BlpapiProvider(MockProvider):
 
         self._releases_cfg = self.config.get("releases", []) or []
         self.fetch_error = None   # surfaced to the dashboard when a live pull fails
+        self.as_of = None         # set per fetch: live timestamp, or the fallback's date
 
     # -- public --------------------------------------------------------------
     def get_releases(self):
         self.fetch_error = None
+        self.as_of = None
         try:
             live = self._fetch_live()
             if not live:
                 # An empty live result is not "calm markets", it is a failure.
                 self.fetch_error = ("Bloomberg returned no usable releases. "
-                                    "Run: python diagnose_bbg.py")
+                                    "Check the uvicorn console for per-ticker errors, "
+                                    "then run: python -m providers.blpapi_provider")
                 live = self._snapshot_fallback()
+            else:
+                # Live data really is current, so say so honestly.
+                self.as_of = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
         except Exception as exc:
             self.fetch_error = f"Bloomberg fetch failed: {exc}"
             print(f"[blpapi] {self.fetch_error}; attempting snapshot fallback")
@@ -394,7 +400,11 @@ class BlpapiProvider(MockProvider):
             try:
                 with open(path, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
-                return list(data.get("releases", [])) if isinstance(data, dict) else list(data)
+                if isinstance(data, dict):
+                    # Report the fallback's own date, not a stale house-view meta.
+                    self.as_of = data.get("as_of")
+                    return list(data.get("releases", []))
+                return list(data)
             except Exception:
                 return []
         return []
