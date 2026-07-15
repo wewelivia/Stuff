@@ -226,15 +226,33 @@ class BlpapiProvider(MockProvider):
             if d
         )
 
-        # 3. Same-day series (policy rates): the print IS the decision, so the
-        #    history date and the publish date are the same day. PX_LAST daily
-        #    history returns a row for EVERY calendar day the rate was in force,
-        #    so without this filter one policy rate floods the window with ~120
-        #    identical rows. Keep only the days a decision actually happened.
-        if entry.get("same_day"):
+        # 3. Dense series (policy rates): PX_LAST daily history returns a row for
+        #    EVERY day the rate was in force, not just decision days, so one rate
+        #    ticker floods the window with ~120 identical rows. Three defences, in
+        #    order, so this cannot depend on config being right:
+        #      a) explicit `same_day: true` in config.yaml
+        #      b) auto-detect: history far denser than the release calendar
+        #      c) if the history dates do not line up with the release calendar,
+        #         fall back to keeping only the days the value actually moved
+        same_day = entry.get("same_day")
+        if same_day is None:
+            same_day = bool(publish_dates) and len(hist) > 3 * len(publish_dates)
+
+        if same_day:
             pub_set = set(publish_dates)
-            hist = [r for r in hist if r.get("date") in pub_set]
+            on_calendar = [r for r in hist if r.get("date") in pub_set]
+            raw = len(hist)
+            if on_calendar:
+                hist = on_calendar
+                how = f"matched {len(hist)} of {len(publish_dates)} calendar dates"
+            else:
+                # Decision dates did not match the history index. Rather than drop
+                # the ticker or flood the window, keep the days the rate changed.
+                hist = self._dedupe_changes(hist, f["actual_hist"])
+                how = (f"calendar dates did not match history; "
+                       f"kept {len(hist)} value changes")
             pub_map = {r["date"]: r["date"] for r in hist if r.get("date")}
+            print(f"[blpapi] {ticker}: dense series, {raw} raw rows -> {how}")
         else:
             period_ends = [r.get("date") for r in hist if r.get("date")]
             pub_map = self._map_publish_dates(period_ends, publish_dates)
@@ -285,6 +303,25 @@ class BlpapiProvider(MockProvider):
             "period_end": period_end,  # kept for audit: which month the print covers
             "source": f"Bloomberg {ticker}",
         }
+
+    @staticmethod
+    def _dedupe_changes(rows, value_field):
+        """
+        Keep only the rows where the value moved.
+
+        Last-resort defence for continuously-quoted series whose history index does
+        not line up with the release calendar. A policy rate held at 3.8% for four
+        months is one event, not eighty. This loses "held again" meetings, which is
+        why matching the release calendar is preferred, but it beats flooding.
+        """
+        out = []
+        last = object()
+        for r in rows:
+            v = r.get(value_field)
+            if v != last:
+                out.append(r)
+                last = v
+        return out
 
     @staticmethod
     def _map_publish_dates(period_ends, publish_dates):
