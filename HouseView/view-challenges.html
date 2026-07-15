@@ -99,6 +99,14 @@
   .foot{margin-top:20px;font-size:11px;color:var(--faint);line-height:1.6}
   .state{padding:40px 16px;text-align:center;color:var(--muted)}
   .err{color:var(--challenge)}
+  .v.upcoming{color:var(--pending);border-color:color-mix(in oklab,var(--pending),transparent 65%)}
+  .v.awaitingprint{color:var(--tbd);border-color:color-mix(in oklab,var(--tbd),transparent 60%);
+    background:color-mix(in oklab,var(--tbd),transparent 92%)}
+  .banner{margin-top:20px;padding:13px 15px;border-radius:10px;font-size:13px;
+    border:1px solid color-mix(in oklab,var(--tbd),transparent 60%);
+    background:color-mix(in oklab,var(--tbd),transparent 92%);color:#e8d9b4}
+  .banner b{color:var(--tbd)}
+  .cd{font-family:var(--mono);font-size:11px;color:var(--faint)}
 </style>
 </head>
 <body>
@@ -118,19 +126,24 @@
 
   <section class="rail" id="rail" aria-label="Theme roll-up"></section>
 
+  <div id="notice"></div>
+
   <div class="card">
-    <h2>Releases scored against the house view</h2>
-    <div id="tableHost">
-      <div class="state">Loading releases…</div>
-    </div>
+    <h2 id="pastHead">Scored · last 10 days</h2>
+    <div id="pastHost"><div class="state">Loading releases…</div></div>
+  </div>
+
+  <div class="card">
+    <h2 id="nextHead">Due next · 5 days</h2>
+    <div id="nextHost"><div class="state">Loading…</div></div>
   </div>
 
   <div class="legend">
     <span><i class="dot" style="background:var(--confirm)"></i>Confirms the house view</span>
     <span><i class="dot" style="background:var(--challenge)"></i>Challenges it</span>
     <span><i class="dot" style="background:var(--inline)"></i>In line with consensus</span>
-    <span><i class="dot" style="background:var(--pending)"></i>Not yet released</span>
-    <span><i class="dot" style="background:var(--tbd)"></i>Unscored / no consensus</span>
+    <span><i class="dot" style="background:var(--pending)"></i>Due, not yet printed</span>
+    <span><i class="dot" style="background:var(--tbd)"></i>Awaiting print / unscored</span>
   </div>
 
   <p class="foot" id="foot"></p>
@@ -162,15 +175,15 @@ function surpCell(r){
 }
 
 async function load(){
-  const host = document.getElementById("tableHost");
-  host.innerHTML = '<div class="state">Loading releases…</div>';
   let data;
   try{
     const res = await fetch("/api/view-challenges", {cache:"no-store"});
     data = await res.json();
     if(data.error) throw new Error(data.error);
   }catch(e){
-    host.innerHTML = `<div class="state err">Could not load data: ${e.message}</div>`;
+    document.getElementById("pastHost").innerHTML =
+      `<div class="state err">Could not load data: ${e.message}</div>`;
+    document.getElementById("nextHost").innerHTML = "";
     return;
   }
 
@@ -201,17 +214,59 @@ async function load(){
       </div>`);
   });
 
-  // table
-  const rows = (data.releases||[]).slice().sort((a,b)=>
-    (b.date_iso||"").localeCompare(a.date_iso||""));
+  // window headers
+  const w = data.window || {};
+  document.getElementById("pastHead").textContent =
+    `Scored · last ${w.lookback_days ?? 10} days`;
+  document.getElementById("nextHead").textContent =
+    `Due next · ${w.lookahead_days ?? 5} days`;
+
+  const all = (data.releases||[]);
+  const past = all.filter(r => r.verdict !== "Upcoming")
+                  .sort((a,b)=>(b.date_iso||"").localeCompare(a.date_iso||""));
+  const next = all.filter(r => r.verdict === "Upcoming")
+                  .sort((a,b)=>(a.date_iso||"").localeCompare(b.date_iso||""));
+
+  renderPast(document.getElementById("pastHost"), past, w);
+  renderNext(document.getElementById("nextHost"), next, w);
+
+  // notices: the honest bit. An empty window usually means stale data, not calm markets.
+  const notice = document.getElementById("notice");
+  notice.innerHTML = "";
+  const stale = (data.provider_mode==="snapshot" && data.as_of &&
+                 daysBetween(data.as_of, w.today) > (w.lookback_days ?? 10));
+  const awaiting = all.filter(r=>r.verdict==="Awaiting print").length;
+
+  if(stale){
+    notice.innerHTML = `<div class="banner"><b>Data is older than the window.</b>
+      The snapshot is dated ${data.as_of}, which is ${daysBetween(data.as_of, w.today)} days ago,
+      so a ${w.lookback_days}-day lookback finds little or nothing. Refresh the snapshot,
+      or switch <span class="cd">provider_mode: blpapi</span> in config.yaml to pull live from Bloomberg.
+      ${w.total_available!=null?`<br><span class="cd">${w.in_window} of ${w.total_available} releases fall inside ${w.from} … ${w.to}</span>`:""}</div>`;
+  } else if(awaiting && data.provider_mode==="blpapi"){
+    notice.innerHTML = `<div class="banner"><b>${awaiting} print${awaiting>1?"s":""} due but showing no number.</b>
+      The date has passed and Bloomberg returned nothing for the actual. Usually a wrong
+      ticker or field mnemonic. Run <span class="cd">python diagnose_bbg.py</span> to see what each field returns.</div>`;
+  }
+
+  document.getElementById("foot").textContent = data.provider_mode==="snapshot"
+    ? `Snapshot data, as current as the last refresh (${data.as_of||"?"}). Window ${w.from} to ${w.to}.`
+    : `Live Bloomberg via the Terminal. Window ${w.from} to ${w.to}.`;
+}
+
+function daysBetween(a,b){
+  try{ return Math.round((new Date(b) - new Date(a))/86400000); }catch(e){ return 0; }
+}
+
+function renderPast(host, rows, w){
   if(!rows.length){
-    host.innerHTML = '<div class="state">No releases in the current dataset.</div>';
+    host.innerHTML = `<div class="state">No prints landed in the last ${w.lookback_days ?? 10} days.</div>`;
     return;
   }
   let html = `<table><thead><tr>
       <th class="l">Date</th><th class="l">Event</th><th class="l">Region</th>
       <th>Actual</th><th>Cons.</th><th>Prev.</th><th>Surprise</th>
-      <th class="l" style="text-align:center">Verdict</th></tr></thead><tbody>`;
+      <th style="text-align:center">Verdict</th></tr></thead><tbody>`;
   rows.forEach(r=>{
     const v = r.verdict || "—";
     html += `<tr>
@@ -226,12 +281,40 @@ async function load(){
       <td style="text-align:center"><span class="v ${vClass(v)}" title="${r.verdict_note||''}">${v}</span></td>
     </tr>`;
   });
-  html += "</tbody></table>";
-  host.innerHTML = html;
+  host.innerHTML = html + "</tbody></table>";
+}
 
-  document.getElementById("foot").textContent = data.provider_mode==="snapshot"
-    ? "Snapshot data, as current as the last refresh (" + (data.as_of||"?") + "). Ask Claude to refresh the House View snapshot for newer prints."
-    : "Live Bloomberg data via the Terminal.";
+function renderNext(host, rows, w){
+  if(!rows.length){
+    host.innerHTML = `<div class="state">Nothing scheduled in the next ${w.lookahead_days ?? 5} days.</div>`;
+    return;
+  }
+  let html = `<table><thead><tr>
+      <th class="l">Date</th><th class="l">Event</th><th class="l">Region</th>
+      <th>Cons.</th><th>Prev.</th><th class="l">Watch for</th>
+      <th style="text-align:center">In</th></tr></thead><tbody>`;
+  rows.forEach(r=>{
+    const d = daysBetween(w.today, r.date_iso);
+    const when = d<=0 ? "today" : (d===1 ? "1 day" : d+" days");
+    html += `<tr>
+      <td class="l sub">${r.date || (r.date_iso||"")}</td>
+      <td class="l"><span class="ev">${r.event||""}</span>
+          <div class="sub">${THEME_LABEL[r.theme]||r.theme||""}</div></td>
+      <td class="l sub">${r.region||""}</td>
+      <td>${fmt(r.consensus, r.unit)}</td>
+      <td>${fmt(r.previous, r.unit)}</td>
+      <td class="l sub">${watchFor(r)}</td>
+      <td style="text-align:center"><span class="v upcoming">${when}</span></td>
+    </tr>`;
+  });
+  host.innerHTML = html + "</tbody></table>";
+}
+
+// What would a print have to do to dent the house view? Derived from the theme rule.
+function watchFor(r){
+  const hot = (r.theme==="inflation"||r.theme==="rate_policy");
+  if(r.theme==="labour") return "labour bias not set";
+  return hot ? "a cooler print challenges" : "a stronger print challenges";
 }
 
 document.getElementById("refresh").addEventListener("click", load);

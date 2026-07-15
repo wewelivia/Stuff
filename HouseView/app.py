@@ -21,6 +21,7 @@ Run
 
 from __future__ import annotations
 
+import datetime
 import os
 
 import yaml
@@ -71,13 +72,30 @@ def build_challenges() -> dict:
     house_view = load_house_view()
     provider, mode = get_provider(config)
 
-    releases = provider.get_releases()
-    result = challenge_engine.assess_releases(releases, house_view)
+    all_releases = provider.get_releases()
+
+    # Scope the dashboard to a rolling window: score the recent past, flag what is due.
+    win = config.get("window", {}) or {}
+    lookback = int(win.get("lookback_days", 10))
+    lookahead = int(win.get("lookahead_days", 5))
+    today = datetime.date.today()
+
+    releases = challenge_engine.filter_window(all_releases, lookback, lookahead, today)
+    result = challenge_engine.assess_releases(releases, house_view, today)
 
     as_of = getattr(provider, "as_of", None) or (house_view.get("meta", {}) or {}).get("as_of")
     result["as_of"] = as_of
     result["provider_mode"] = mode
     result["meta"] = house_view.get("meta", {})
+    result["window"] = {
+        "lookback_days": lookback,
+        "lookahead_days": lookahead,
+        "from": (today - datetime.timedelta(days=lookback)).isoformat(),
+        "to": (today + datetime.timedelta(days=lookahead)).isoformat(),
+        "today": today.isoformat(),
+        "in_window": len(releases),
+        "total_available": len(all_releases),
+    }
     return result
 
 
