@@ -1,50 +1,49 @@
 """
-BlpapiProvider - live Bloomberg data source for the View Challenges dashboard.
+BlpapiProvider - live Bloomberg data source, built on what the Terminal actually has.
 
-WHY THIS EXISTS
----------------
-Bloomberg carries economic-release consensus natively, which no free calendar API
-does. On the work PC (Bloomberg Terminal + blpapi installed) this provider serves
-the standard get_releases() contract live off the Terminal. On a machine without
-Bloomberg (e.g. the Mac) you run provider_mode: snapshot instead. Same contract,
-same engine, same HTML. Nothing downstream changes.
+THE DIAGNOSIS THIS IS BUILT ON
+------------------------------
+diagnose_bbg.py established, against the real Terminal:
 
-WHAT IT SOLVES (from the Phase 1 diagnosis)
--------------------------------------------
-The SNAPSHOT field ACTUAL_RELEASE came back blank; only ECO_FUTURE_RELEASE_DATE
-resolved. Historical actuals existed but were keyed to PERIOD-END dates
-(e.g. 2026-05-31), not PUBLISH dates. This provider fetches the publish-date list
-per ticker over a window (ECO_FUTURE_RELEASE_DATE_LIST with START_DT / END_DT
-overrides) and remaps each period-end actual to its publish date: the earliest
-calendar date in the release-date list that is on or after the period-end.
+  ACTUAL_RELEASE                 FIELD NOT VALID   (on every ticker)
+  PREVIOUS_VALUE                 FIELD NOT VALID   (on every ticker)
+  ECO_RELEASE_PERIOD_END_DATE    FIELD NOT VALID   (on every ticker)
+  BN_SURVEY_MEDIAN (reference)   empty
+  ECO_FUTURE_RELEASE_DATE_LIST   OK, ~36 publish dates
+  ECO_RELEASE_DT                 OK, the next scheduled release date
 
-CONTRACT (identical to every other provider)
---------------------------------------------
+  HISTORY (the important part):
+  PX_LAST           4 rows   2026-04-30=3.8, 2026-05-31=4.2, 2026-06-30=3.5
+  BN_SURVEY_MEDIAN  4 rows   2026-04-30=3.7, 2026-05-31=4.2, 2026-06-30=3.8
+
+So the actual is NOT a reference field on economic-release securities. It lives in
+history, keyed to the PERIOD-END date. Critically, BN_SURVEY_MEDIAN historises too,
+on the same period-end key, which is what makes scoring PAST surprises possible.
+
+HOW IT WORKS
+------------
+Per ticker, two requests:
+
+  1. HistoricalDataRequest  PX_LAST + BN_SURVEY_MEDIAN over the lookback window.
+     Each returned row IS a release: date=period end, PX_LAST=actual,
+     BN_SURVEY_MEDIAN=consensus. `previous` is simply the prior row's PX_LAST,
+     so no separate field is needed.
+
+  2. ReferenceDataRequest   ECO_FUTURE_RELEASE_DATE_LIST + ECO_RELEASE_DT
+     for the publish dates and the next scheduled release.
+
+Then the Phase 1 remap joins them: a print for period-end 2026-06-30 is stamped with
+the earliest publish date on or after it (mid-July), because the dashboard's window
+is about when a number HIT THE SCREEN, not which month it describes.
+
+Finally one Upcoming record per ticker from ECO_RELEASE_DT, carrying the last actual
+as `previous`. Forward consensus is usually absent (BN_SURVEY_MEDIAN is empty as a
+reference field), so it is left None rather than invented.
+
+CONTRACT (unchanged, as every provider must serve)
+--------------------------------------------------
   event, region, pillar, theme, impact, assets, higher_is, unit,
   date ("%d %b %Y"), date_iso, consensus, actual, previous, status
-Records are returned sorted by date_iso DESCENDING. Released items carry
-actual + consensus + previous; Upcoming items leave consensus/actual null.
-
-STATIC vs LIVE
---------------
-The static metadata (event, region, pillar, theme, impact, assets, higher_is,
-unit) comes from each release entry in config.yaml. Only the numbers and the
-publish date/status are pulled live from Bloomberg and merged in.
-
-FIELD MNEMONICS - VERIFY ON THE TERMINAL
-----------------------------------------
-Bloomberg field names for economic releases vary by ticker family. The mnemonics
-below are the defaults; override any of them in config.yaml under blpapi.fields
-after confirming with FLDS<GO> on the actual tickers. Getting these wrong is the
-single most likely reason a print shows blank, so treat the defaults as a starting
-point, not gospel.
-
-GRACEFUL DEGRADATION
---------------------
-If the session cannot start (Terminal closed, blpapi missing, wrong host/port) the
-provider does not crash the dashboard. If a local snapshot file is present it
-serves that as a fallback; otherwise it returns an empty calendar. This matches the
-project's "never break the dashboard" behaviour.
 """
 
 from __future__ import annotations
@@ -55,13 +54,13 @@ import os
 
 try:
     from providers.mock_provider import MockProvider
-except Exception:  # pragma: no cover - tolerate a different import path in your tree
+except Exception:  # pragma: no cover
     MockProvider = object
 
 try:
     import blpapi  # type: ignore
     _HAVE_BLPAPI = True
-except Exception:  # pragma: no cover - not installed on the Mac; snapshot mode is used there
+except Exception:  # pragma: no cover - not installed on the Mac
     blpapi = None  # type: ignore
     _HAVE_BLPAPI = False
 
@@ -72,23 +71,20 @@ CONTRACT_FIELDS = (
     "actual", "previous", "status",
 )
 
-# Default Bloomberg field mnemonics. Override in config.yaml -> blpapi.fields.
-# Confirm each against your real tickers with FLDS<GO> before trusting them.
+# Verified against the Terminal by diagnose_bbg.py. Override in config.yaml if a
+# particular ticker family needs something different.
 DEFAULT_FIELDS = {
-    "release_date_list": "ECO_FUTURE_RELEASE_DATE_LIST",  # bulk: array of publish dates
-    "consensus": "BN_SURVEY_MEDIAN",                      # survey median (consensus)
-    "actual": "ACTUAL_RELEASE",                           # actual print
-    "previous": "PREVIOUS_VALUE",                         # prior print (or *_REVISED_VALUE)
-    "period_end": "ECO_RELEASE_PERIOD_END_DATE",          # period the actual refers to
+    "actual_hist": "PX_LAST",                            # historical: the print
+    "consensus_hist": "BN_SURVEY_MEDIAN",                # historical: the survey
+    "release_date_list": "ECO_FUTURE_RELEASE_DATE_LIST",  # reference: publish dates
+    "next_release": "ECO_RELEASE_DT",                    # reference: next release
 }
 
-# How far back / forward to pull the release-date list, in days, around "today".
 DEFAULT_WINDOW_BACK_DAYS = 120
 DEFAULT_WINDOW_FWD_DAYS = 45
 
 
 def _to_iso(d) -> str | None:
-    """Coerce a blpapi/date/datetime/string into 'YYYY-MM-DD' or None."""
     if d is None:
         return None
     if isinstance(d, (_dt.datetime, _dt.date)):
@@ -96,7 +92,6 @@ def _to_iso(d) -> str | None:
     s = str(d).strip()
     if not s:
         return None
-    # blpapi often hands back 'YYYY-MM-DD' already; guard a couple of variants.
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"):
         try:
             return _dt.datetime.strptime(s[:10], fmt).strftime("%Y-%m-%d")
@@ -106,7 +101,6 @@ def _to_iso(d) -> str | None:
 
 
 def _pretty(iso: str | None) -> str | None:
-    """'YYYY-MM-DD' -> '%d %b %Y' to match the contract's display date."""
     if not iso:
         return None
     try:
@@ -130,24 +124,31 @@ class BlpapiProvider(MockProvider):
         self.host = blp_cfg.get("host", "localhost")
         self.port = int(blp_cfg.get("port", 8194))
         self.fields = {**DEFAULT_FIELDS, **(blp_cfg.get("fields") or {})}
-        self.ticker_key = blp_cfg.get("ticker_key", "ticker")   # config release -> Bloomberg id
+        self.ticker_key = blp_cfg.get("ticker_key", "ticker")
         self.window_back = int(blp_cfg.get("window_back_days", DEFAULT_WINDOW_BACK_DAYS))
         self.window_fwd = int(blp_cfg.get("window_fwd_days", DEFAULT_WINDOW_FWD_DAYS))
 
-        # Optional snapshot fallback so a closed Terminal never blanks the dashboard.
         self.snapshot_fallback = blp_cfg.get(
             "snapshot_fallback",
             os.path.join(os.path.dirname(__file__), "releases_snapshot.json"),
         )
 
         self._releases_cfg = self.config.get("releases", []) or []
+        self.fetch_error = None   # surfaced to the dashboard when a live pull fails
 
-    # -- the only "live" method ---------------------------------------------
+    # -- public --------------------------------------------------------------
     def get_releases(self):
+        self.fetch_error = None
         try:
             live = self._fetch_live()
-        except Exception as exc:  # never crash the dashboard
-            print(f"[blpapi] live fetch failed ({exc!r}); attempting snapshot fallback")
+            if not live:
+                # An empty live result is not "calm markets", it is a failure.
+                self.fetch_error = ("Bloomberg returned no usable releases. "
+                                    "Run: python diagnose_bbg.py")
+                live = self._snapshot_fallback()
+        except Exception as exc:
+            self.fetch_error = f"Bloomberg fetch failed: {exc}"
+            print(f"[blpapi] {self.fetch_error}; attempting snapshot fallback")
             live = self._snapshot_fallback()
 
         for r in live:
@@ -167,19 +168,21 @@ class BlpapiProvider(MockProvider):
         session = self._open_session()
         try:
             svc = session.getService("//blp/refdata")
-
             today = _dt.date.today()
             start = (today - _dt.timedelta(days=self.window_back)).strftime("%Y%m%d")
-            end = (today + _dt.timedelta(days=self.window_fwd)).strftime("%Y%m%d")
+            end = today.strftime("%Y%m%d")
 
             out = []
             for entry in self._releases_cfg:
                 ticker = entry.get(self.ticker_key) or entry.get("bbg_ticker")
                 if not ticker:
-                    continue  # a release with no Bloomberg id is skipped, not fatal
-                merged = self._fetch_one(session, svc, ticker, entry, start, end)
-                if merged:
-                    out.append(merged)
+                    continue
+                try:
+                    out.extend(self._fetch_one(session, svc, ticker, entry,
+                                               start, end, today))
+                except Exception as exc:
+                    # One bad ticker must not take down the whole calendar.
+                    print(f"[blpapi] {ticker}: {exc}")
             return out
         finally:
             try:
@@ -198,38 +201,52 @@ class BlpapiProvider(MockProvider):
             raise RuntimeError("could not open //blp/refdata")
         return session
 
-    def _fetch_one(self, session, svc, ticker, entry, start_dt, end_dt):
-        """Pull the live numbers for one ticker and merge with its static metadata."""
+    def _fetch_one(self, session, svc, ticker, entry, start, end, today):
         f = self.fields
-        req = svc.createRequest("ReferenceDataRequest")
-        req.append("securities", ticker)
-        for key in ("consensus", "actual", "previous", "period_end", "release_date_list"):
-            req.append("fields", f[key])
 
-        # Override the release-date list window so we get publish dates around now.
-        for name, val in (("START_DT", start_dt), ("END_DT", end_dt)):
-            ov = req.getElement("overrides").appendElement()
-            ov.setElement("fieldId", name)
-            ov.setElement("value", val)
+        # 1. History: every row here IS a release (period-end keyed).
+        hist = self._history(session, svc, ticker,
+                             [f["actual_hist"], f["consensus_hist"]], start, end)
 
-        data = self._request(session, req, ticker)
-        if data is None:
-            return None
+        # 2. Reference: publish dates + next scheduled release.
+        ref = self._reference(session, svc, ticker,
+                              [f["release_date_list"], f["next_release"]])
 
-        actual = data.get(f["actual"])
-        consensus = data.get(f["consensus"])
-        previous = data.get(f["previous"])
-        period_end = _to_iso(data.get(f["period_end"]))
-        publish_dates = [_to_iso(d) for d in (data.get(f["release_date_list"]) or [])]
-        publish_dates = sorted(d for d in publish_dates if d)
+        publish_dates = sorted(
+            d for d in (_to_iso(x) for x in (ref.get(f["release_date_list"]) or []))
+            if d
+        )
 
-        publish_iso = self._remap_publish_date(period_end, publish_dates)
-        status = "Released" if actual not in (None, "") else "Upcoming"
-        if status == "Upcoming":
-            actual = None  # do not carry a stale/blank actual on an upcoming print
+        records = []
+        prev_actual = None
+        period_ends = [r.get("date") for r in hist if r.get("date")]
+        pub_map = self._map_publish_dates(period_ends, publish_dates)
 
+        for row in hist:                       # ascending by period end
+            period_end = row.get("date")
+            actual = row.get(f["actual_hist"])
+            consensus = row.get(f["consensus_hist"])
+            if period_end is None or actual is None:
+                continue
+
+            publish_iso = pub_map.get(period_end, period_end)
+            records.append(self._record(entry, publish_iso, actual, consensus,
+                                        prev_actual, "Released", ticker, period_end))
+            prev_actual = actual
+
+        # 3. The next scheduled print. Consensus is normally unavailable ahead of
+        #    time on these tickers, so it stays None rather than being invented.
+        next_iso = _to_iso(ref.get(f["next_release"]))
+        if next_iso and next_iso > today.isoformat():
+            records.append(self._record(entry, next_iso, None, None,
+                                        prev_actual, "Upcoming", ticker, None))
+
+        return records
+
+    def _record(self, entry, date_iso, actual, consensus, previous, status,
+                ticker, period_end):
         return {
-            # static metadata straight from config.yaml
+            # static metadata from config.yaml
             "event": entry.get("event"),
             "region": entry.get("region"),
             "pillar": entry.get("pillar"),
@@ -238,21 +255,56 @@ class BlpapiProvider(MockProvider):
             "assets": entry.get("assets"),
             "higher_is": entry.get("higher_is"),
             "unit": entry.get("unit"),
-            # live values from Bloomberg
-            "date": _pretty(publish_iso),
-            "date_iso": publish_iso,
+            # live values
+            "date": _pretty(date_iso),
+            "date_iso": date_iso,
             "consensus": consensus,
             "actual": actual,
             "previous": previous,
-            "status": status,
-            "source": f"Bloomberg {ticker} ({f['actual']})",
+            "status": status,          # the engine re-derives this from the date
+            "period_end": period_end,  # kept for audit: which month the print covers
+            "source": f"Bloomberg {ticker}",
         }
 
     @staticmethod
+    def _map_publish_dates(period_ends, publish_dates):
+        """
+        Assign each period-end its publish date, walking both lists forward together.
+
+        Why not just "earliest publish date on or after the period-end" per row: when
+        a period-end lands exactly on a release date, that rule hands the SAME publish
+        date to two consecutive prints (seen with Core PCE: period-end 31 Mar and
+        30 Apr both mapping to 30 Apr). Consuming the list monotonically guarantees
+        each print gets its own, strictly later, publish date.
+
+        A print for period-end 30 Jun hits the screen in mid-July. The dashboard's
+        window is about when the number LANDED, not which month it describes.
+
+        If the release-date list runs out, the period-end itself is used. That is
+        wrong but visible, rather than silently dropping the release.
+        """
+        out = {}
+        cursor = 0
+        last = None
+        for pe in sorted(period_ends):
+            chosen = None
+            i = cursor
+            while i < len(publish_dates):
+                d = publish_dates[i]
+                if d >= pe and (last is None or d > last):
+                    chosen = d
+                    cursor = i + 1
+                    break
+                i += 1
+            out[pe] = chosen if chosen else pe
+            last = out[pe]
+        return out
+
+    @staticmethod
     def _remap_publish_date(period_end_iso, publish_dates):
-        """Earliest publish date on or after the period-end. Falls back sensibly."""
+        """Single-row version, kept for tests and ad-hoc use."""
         if publish_dates and period_end_iso:
-            for d in publish_dates:  # already sorted ascending
+            for d in publish_dates:
                 if d >= period_end_iso:
                     return d
             return publish_dates[-1]
@@ -260,58 +312,95 @@ class BlpapiProvider(MockProvider):
             return publish_dates[-1]
         return period_end_iso
 
-    # -- blpapi event-loop plumbing -----------------------------------------
-    # Minimal and synchronous: send one request, drain events until RESPONSE,
-    # return a flat {field_name: value} dict (arrays become Python lists).
+    # -- blpapi plumbing -----------------------------------------------------
     @staticmethod
-    def _request(session, request, ticker):
-        session.sendRequest(request)
-        out = {}
+    def _drain(session):
+        msgs = []
         while True:
-            ev = session.nextEvent(5000)
-            for msg in ev:
-                if not msg.hasElement("securityData"):
-                    continue
-                secs = msg.getElement("securityData")
-                for i in range(secs.numValues()):
-                    sd = secs.getValueAsElement(i)
-                    if sd.hasElement("securityError"):
-                        print(f"[blpapi] securityError for {ticker}")
-                        return None
-                    fd = sd.getElement("fieldData")
-                    for j in range(fd.numElements()):
-                        el = fd.getElement(j)
-                        name = str(el.name())
-                        if el.isArray():
-                            vals = []
-                            for k in range(el.numValues()):
-                                row = el.getValueAsElement(k)
-                                if row.numElements():
-                                    vals.append(row.getElement(0).getValue())
-                            out[name] = vals
-                        else:
-                            out[name] = el.getValue()
+            ev = session.nextEvent(10000)
+            for m in ev:
+                msgs.append(m)
             if ev.eventType() == blpapi.Event.RESPONSE:
                 break
+        return msgs
+
+    def _history(self, session, svc, ticker, fields, start, end):
+        """HistoricalDataRequest -> [{date, FIELD: value, ...}] ascending."""
+        req = svc.createRequest("HistoricalDataRequest")
+        req.append("securities", ticker)
+        for f in fields:
+            req.append("fields", f)
+        req.set("startDate", start)
+        req.set("endDate", end)
+        req.set("periodicitySelection", "DAILY")
+
+        session.sendRequest(req)
+        rows = []
+        for msg in self._drain(session):
+            if not msg.hasElement("securityData"):
+                continue
+            sd = msg.getElement("securityData")
+            if sd.hasElement("securityError"):
+                raise RuntimeError("security error in history request")
+            fdarr = sd.getElement("fieldData")
+            for i in range(fdarr.numValues()):
+                el = fdarr.getValueAsElement(i)
+                row = {"date": _to_iso(el.getElementAsDatetime("date"))
+                       if el.hasElement("date") else None}
+                for f in fields:
+                    row[f] = el.getElement(f).getValue() if el.hasElement(f) else None
+                rows.append(row)
+        rows.sort(key=lambda r: r.get("date") or "")
+        return rows
+
+    def _reference(self, session, svc, ticker, fields):
+        """ReferenceDataRequest -> {FIELD: value}; arrays become Python lists."""
+        req = svc.createRequest("ReferenceDataRequest")
+        req.append("securities", ticker)
+        for f in fields:
+            req.append("fields", f)
+
+        session.sendRequest(req)
+        out = {}
+        for msg in self._drain(session):
+            if not msg.hasElement("securityData"):
+                continue
+            secs = msg.getElement("securityData")
+            for i in range(secs.numValues()):
+                sd = secs.getValueAsElement(i)
+                if sd.hasElement("securityError"):
+                    raise RuntimeError("security error in reference request")
+                fd = sd.getElement("fieldData")
+                for j in range(fd.numElements()):
+                    el = fd.getElement(j)
+                    name = str(el.name())
+                    if el.isArray():
+                        vals = []
+                        for k in range(el.numValues()):
+                            r = el.getValueAsElement(k)
+                            if r.numElements():
+                                vals.append(r.getElement(0).getValue())
+                        out[name] = vals
+                    else:
+                        out[name] = el.getValue()
         return out
 
     # -- snapshot fallback ---------------------------------------------------
     def _snapshot_fallback(self):
         path = self.snapshot_fallback
+        if path and not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(os.path.dirname(__file__)), path)
         if path and os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
-                if isinstance(data, dict):
-                    return list(data.get("releases", []))
-                return list(data)
+                return list(data.get("releases", [])) if isinstance(data, dict) else list(data)
             except Exception:
                 return []
         return []
 
 
 if __name__ == "__main__":
-    # Smoke test on the work PC:  python -m providers.blpapi_provider
     import yaml  # type: ignore
     cfg_path = os.path.join(os.path.dirname(__file__), "..", "config.yaml")
     cfg = {}
@@ -320,7 +409,8 @@ if __name__ == "__main__":
             cfg = yaml.safe_load(fh) or {}
     prov = BlpapiProvider(cfg)
     rows = prov.get_releases()
-    print(f"{len(rows)} releases")
-    for r in rows[:5]:
-        print(r.get("date_iso"), r.get("event"), "actual=", r.get("actual"),
-              "cons=", r.get("consensus"), r.get("status"))
+    print(f"{len(rows)} releases; fetch_error={prov.fetch_error}")
+    for r in rows[:12]:
+        print(f"  {r.get('date_iso')}  {str(r.get('event'))[:26]:<26} "
+              f"a={r.get('actual')} c={r.get('consensus')} p={r.get('previous')} "
+              f"[{r.get('status')}]")
