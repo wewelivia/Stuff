@@ -57,7 +57,7 @@ code{background:var(--panel);border:1px solid var(--line);border-radius:5px;padd
 //                                 (use this when opening the file directly
 //                                 loses all CSS/JS formatting)
 const MONITORS=[
-  {name:'View Challenges', desc:'Economic releases scored against the house view — challenge, confirm or neutral across six themes.', port:8000, html:'../HouseView/view-challenges.html'},
+  {name:'View Challenges', desc:'Economic releases scored against the house view — challenge, confirm or neutral across six themes.', port:8000, served:true},
   {name:'Market Monitor', desc:'What is moving markets, outsized moves vs 1y vol, correlation shifts and the growth/inflation regime quadrant.', port:8010, html:'../MarketMonitor/market-monitor.html'},
   {name:'Option Implied', desc:'Option-implied market monitor.', port:8020, served:true},
 ];
@@ -95,12 +95,22 @@ setLinks();
 async function ping(){
   await Promise.all(MONITORS.map(async(m,i)=>{
     const dot=document.getElementById('dot'+i), st=document.getElementById('st'+i);
+    const base=`http://${host()}:${m.port}`;
     try{
       const ctl=new AbortController(); setTimeout(()=>ctl.abort(),3000);
-      const r=await fetch(`http://${host()}:${m.port}/openapi.json`,{signal:ctl.signal});
+      const r=await fetch(base+'/openapi.json',{signal:ctl.signal});
       if(r.ok){dot.className='dot ok';st.textContent='running on :'+m.port;return;}
       throw new Error(r.status);
-    }catch(e){dot.className='dot down';st.textContent='offline (:'+m.port+')';}
+    }catch(e){
+      // openapi.json unavailable or CORS-blocked from file:// — fall back to a
+      // no-cors probe: response is unreadable, but completing proves the
+      // server is reachable.
+      try{
+        const ctl2=new AbortController(); setTimeout(()=>ctl2.abort(),3000);
+        await fetch(base+'/',{mode:'no-cors',signal:ctl2.signal});
+        dot.className='dot ok';st.textContent='running on :'+m.port;
+      }catch(e2){dot.className='dot down';st.textContent='offline (:'+m.port+')';}
+    }
   }));
 }
 ping(); setInterval(ping,5000);
