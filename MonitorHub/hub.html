@@ -48,11 +48,18 @@ code{background:var(--panel);border:1px solid var(--line);border-radius:5px;padd
   Edit the <code>MONITORS</code> list at the top of this file's script to adjust names, ports or dashboard paths.</p>
 </main>
 <script>
-// ---- edit to match monitors.yaml + where each dashboard HTML lives ----
+// ---- edit to match monitors.yaml ---------------------------------------
+// Two kinds of dashboard:
+//   html: 'path/to/file.html'  -> standalone HTML opened from disk
+//                                 (View Challenges, Market Monitor)
+//   served: true               -> frontend served BY the backend itself;
+//                                 the link becomes http://<host>:<port>/
+//                                 (use this when opening the file directly
+//                                 loses all CSS/JS formatting)
 const MONITORS=[
   {name:'View Challenges', desc:'Economic releases scored against the house view — challenge, confirm or neutral across six themes.', port:8000, html:'../HouseView/view-challenges.html'},
   {name:'Market Monitor', desc:'What is moving markets, outsized moves vs 1y vol, correlation shifts and the growth/inflation regime quadrant.', port:8010, html:'../MarketMonitor/market-monitor.html'},
-  {name:'Option Implied', desc:'Option-implied market monitor.', port:8020, html:'../OptionImplied/index.html'},
+  {name:'Option Implied', desc:'Option-implied market monitor.', port:8020, served:true},
 ];
 // -----------------------------------------------------------------------
 const LSK_HOST='hv-hub-host', LSK_THEME='hv-theme';
@@ -67,7 +74,7 @@ document.getElementById('theme').onclick=()=>{
 document.getElementById('host').value=host();
 document.getElementById('savehost').onclick=()=>{
   localStorage.setItem(LSK_HOST,document.getElementById('host').value.trim()||'127.0.0.1');
-  ping();
+  setLinks();ping();
 };
 
 document.getElementById('cards').innerHTML=MONITORS.map((m,i)=>`
@@ -75,8 +82,15 @@ document.getElementById('cards').innerHTML=MONITORS.map((m,i)=>`
     <h2>${m.name}</h2>
     <div class="desc">${m.desc}</div>
     <div class="status"><span class="dot" id="dot${i}"></span><span id="st${i}">checking…</span></div>
-    <a class="open" href="${m.html}">Open dashboard</a>
+    <a class="open" id="open${i}" href="${m.served?'#':m.html}">Open dashboard</a>
   </div>`).join('');
+
+function setLinks(){
+  MONITORS.forEach((m,i)=>{
+    if(m.served)document.getElementById('open'+i).href=`http://${host()}:${m.port}/`;
+  });
+}
+setLinks();
 
 async function ping(){
   await Promise.all(MONITORS.map(async(m,i)=>{
