@@ -22,7 +22,17 @@ settings:
   bbg_host: localhost
   bbg_port: 8194
   history_start_days: 1300        # ~3.5y of calendar days fetched
-  zscore_lookback: 252            # trading days for move standardisation
+  # Vol-adjusted move scoring (merged in from the Vol-Adjusted Market
+  # Dashboard): z = move / (daily vol x sqrt(horizon)), daily vol over a
+  # vol_window ending before the move starts. Horizons are fully dynamic:
+  # add or remove entries and the table follows, no code change.
+  vol_window: 63                  # trading days of realised vol (~3 months)
+  horizons:
+    - {key: "1d", days: 1}
+    - {key: "1w", days: 5}
+    - {key: "1m", days: 21}
+    - {key: "3m", days: 63}
+  zscore_lookback: 252            # retained for reference; superseded by vol_window
   trend_window: 63                # ~3m, used for regime composites and correlation windows
   cache_ttl_minutes: 15
   cache_file: market_cache.json

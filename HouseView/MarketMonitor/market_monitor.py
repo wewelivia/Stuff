@@ -3,11 +3,20 @@ Market Monitor engine — House View dashboard extension.
 
 Fetches daily market data — Bloomberg blpapi (primary, on the Terminal
 machine) or FRED + Stooq (web fallback) — then computes:
-  * standardised 1d / 5d moves (z-scores vs a trailing lookback)
-  * outsized-move flags
+  * VOL-ADJUSTED moves over dynamic horizons (1d / 1w / 1m / 3m by default):
+    each move divided by realised daily vol (63-trading-day window ending
+    before the move starts) scaled by sqrt(horizon), so every cell reads in
+    standard deviations and a 40bp Bund shift and a 3% Nasdaq drop are
+    directly comparable
+  * outsized-move flags (vol-adjusted 1d)
   * rolling cross-asset correlation shifts
   * a growth/inflation regime quadrant (goldilocks / reflation /
     stagflation / disinflation)
+
+The vol-adjusted methodology replaced the original "z of the latest change
+vs a 1y distribution of changes" when the standalone Vol-Adjusted Market
+Dashboard was merged into this monitor. Regime and correlation logic are
+unchanged from the original.
 
 The source is selected via `settings.data_source` in market_universe.yaml
 (bbg | web) — same swappable-provider principle as the rest of House View:
@@ -41,6 +50,14 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
 _MEM_CACHE: dict = {"payload": None, "ts": 0.0}
+
+DEFAULT_HORIZONS = [
+    {"key": "1d", "days": 1},
+    {"key": "1w", "days": 5},
+    {"key": "1m", "days": 21},
+    {"key": "3m", "days": 63},
+]
+DEFAULT_VOL_WINDOW = 63
 
 
 # --------------------------------------------------------------------------
@@ -255,6 +272,60 @@ def _correlation(xs: list[float], ys: list[float]) -> float | None:
 
 
 # --------------------------------------------------------------------------
+# Vol-adjusted move scoring (merged in from the Vol-Adjusted Market Dashboard)
+# --------------------------------------------------------------------------
+
+def _h_move(values: list[float], days: int, kind: str) -> float | None:
+    """The h-trading-day move in display units: % for prices, bp for
+    yields/OAS, points for levels. Computed from levels, not summed daily
+    changes, so it is exact."""
+    if len(values) < days + 1:
+        return None
+    prev, cur = values[-1 - days], values[-1]
+    if kind in ("yield", "oas"):
+        return (cur - prev) * 100.0
+    if kind == "level":
+        return cur - prev
+    if prev == 0:
+        return None
+    return 100.0 * (cur - prev) / prev
+
+
+def vol_adjusted_scores(values: list[float], kind: str,
+                        horizons: list[dict], vol_window: int) -> dict:
+    """
+    {key: {"move": float, "z": float} | None} per horizon.
+
+    z = (h-day move) / (daily vol * sqrt(h)), with daily vol the stdev of
+    daily changes over `vol_window` trading days ending BEFORE the move
+    starts — a large move must not inflate its own yardstick. A flat or
+    too-short series returns None for that horizon: a dot beats a made-up
+    number.
+    """
+    chg = _changes(values, 1, kind)
+    out: dict = {}
+    for h in horizons:
+        key, days = h["key"], int(h["days"])
+        move = _h_move(values, days, kind)
+        if move is None or len(chg) < days + 12:
+            out[key] = None
+            continue
+        vol_slice = chg[-(days + vol_window):-days]
+        if len(vol_slice) < max(10, vol_window // 3):
+            vol_slice = chg[:-days]
+            if len(vol_slice) < 10:
+                out[key] = None
+                continue
+        sigma = _std(vol_slice)
+        if not sigma or sigma <= 0:
+            out[key] = None
+            continue
+        out[key] = {"move": round(move, 2),
+                    "z": round(move / (sigma * math.sqrt(days)), 2)}
+    return out
+
+
+# --------------------------------------------------------------------------
 # Per-series stats
 # --------------------------------------------------------------------------
 
@@ -265,11 +336,24 @@ def analyse_series(cfg: dict, data: list[tuple[str, float]], settings: dict) -> 
     dates = [d for d, _ in data]
     values = _normalise_units(cfg, [v for _, v in data])
     kind = cfg.get("kind", "price")
-    lb = settings.get("zscore_lookback", 252)
 
-    chg1 = _changes(values, 1, kind)
-    chg5 = _changes(values, 5, kind)
+    horizons = settings.get("horizons") or DEFAULT_HORIZONS
+    vol_window = int(settings.get("vol_window", DEFAULT_VOL_WINDOW))
+
     last, last_date = values[-1], dates[-1]
+
+    # vol-adjusted moves over the configured horizons
+    h_scores = vol_adjusted_scores(values, kind, horizons, vol_window)
+
+    # fixed 1d / 5d scores kept for the movers panel and API compatibility,
+    # regardless of which horizons are configured for the table
+    fixed = vol_adjusted_scores(
+        values, kind,
+        [{"key": "_1d", "days": 1}, {"key": "_5d", "days": 5}], vol_window)
+    z1 = fixed["_1d"]["z"] if fixed.get("_1d") else None
+    c1 = fixed["_1d"]["move"] if fixed.get("_1d") else None
+    z5 = fixed["_5d"]["z"] if fixed.get("_5d") else None
+    c5 = fixed["_5d"]["move"] if fixed.get("_5d") else None
 
     # YTD change
     year_start = f"{last_date[:4]}-01-01"
@@ -281,12 +365,7 @@ def analyse_series(cfg: dict, data: list[tuple[str, float]], settings: dict) -> 
     else:
         chg_ytd = round(100.0 * (last - base) / base, 2) if base else None
 
-    z1 = _zscore(chg1[-1], chg1[-lb:]) if chg1 else None
-    z5 = _zscore(chg5[-1], chg5[-lb:]) if chg5 else None
-
     display_last = round(last * 100.0, 0) if kind == "oas" else round(last, 3)
-    c1 = round(chg1[-1], 2) if chg1 else None
-    c5 = round(chg5[-1], 2) if chg5 else None
 
     # staleness (calendar-day approximation of business days)
     try:
@@ -308,8 +387,9 @@ def analyse_series(cfg: dict, data: list[tuple[str, float]], settings: dict) -> 
         "chg_1d": c1,
         "chg_5d": c5,
         "chg_ytd": chg_ytd,
-        "z_1d": z1,
-        "z_5d": z5,
+        "z_1d": z1,                    # vol-adjusted since the merge
+        "z_5d": z5,                    # vol-adjusted since the merge
+        "horizons": h_scores,          # the table columns
         "pctile_3y": _percentile_of(last, values),
         "stale": stale,
         "spark": [round(v, 4) for v in spark],
@@ -514,6 +594,9 @@ def build_monitor(universe_path: str = UNIVERSE_FILE, use_cache: bool = True) ->
         "data_source": mode,
         "generated_in_s": round(time.time() - t0, 1),
         "outsized_z": outsized_z,
+        "horizons": [{"key": h["key"], "days": int(h["days"])}
+                     for h in (settings.get("horizons") or DEFAULT_HORIZONS)],
+        "vol_window": int(settings.get("vol_window", DEFAULT_VOL_WINDOW)),
         "regime": regime,
         "correlations": corr,
         "movers": [public(s) for s in movers],

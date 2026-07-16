@@ -61,9 +61,11 @@ table.mkt tr:last-child td{border-bottom:none}
 .zcell{border-radius:6px;padding:2px 8px;display:inline-block;min-width:46px}
 .zhot{background:var(--z-hot);color:var(--down);font-weight:650}
 .zcool{background:var(--z-cool);color:var(--up);font-weight:650}
+.zmove{display:block;color:var(--muted);font-size:11px;margin-top:1px}
 .stale{opacity:.5}
 .small{color:var(--muted);font-size:11px}
 .spark{vertical-align:middle}
+.method{margin-top:10px;color:var(--muted);font-size:11px;line-height:1.5}
 #gear-panel{display:none;position:fixed;right:20px;top:60px;z-index:10;width:320px}
 #gear-panel input{width:100%;font:inherit;padding:7px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);margin:8px 0}
 #status{padding:40px;text-align:center;color:var(--muted)}
@@ -119,12 +121,13 @@ table.mkt tr:last-child td{border-bottom:none}
     </div>
 
     <div class="panel" style="margin-top:16px">
-      <h2>Outsized moves (|z| ≥ <span id="zthresh"></span> vs 1y)</h2>
+      <h2>Outsized vol-adjusted moves (1d, |z| ≥ <span id="zthresh"></span>)</h2>
       <div class="movers" id="movers"></div>
     </div>
 
     <div class="tabs" id="tabs"></div>
     <table class="mkt" id="mkttable"></table>
+    <div class="method" id="method"></div>
     <div class="errbox" id="errors"></div>
   </div>
 </main>
@@ -136,16 +139,18 @@ let DATA=null, activeTab='all';
 
 function apiBase(){return localStorage.getItem(LSK_API)||'http://127.0.0.1:8000';}
 function fmt(v,dp){return v==null?'–':Number(v).toLocaleString('en-GB',{minimumFractionDigits:dp,maximumFractionDigits:dp});}
-function chgTxt(s,v){
+function moveTxt(s,v){
   if(v==null)return '–';
   const u=(s.kind==='yield'||s.kind==='oas')?'bp':(s.kind==='level'?'pts':'%');
   return (v>0?'+':'')+fmt(v,u==='bp'?0:2)+u;
 }
 function cls(v){return v==null?'':(v>0?'pos':'neg');}
-function zCell(z){
-  if(z==null)return '<span class="small">–</span>';
-  const c=Math.abs(z)>=2?(z>0?'zhot':'zcool'):'';
-  return `<span class="zcell ${c}">${z>0?'+':''}${z.toFixed(1)}σ</span>`;
+function hCell(s,key){
+  const c=(s.horizons||{})[key];
+  if(!c||c.z==null)return '<span class="small">–</span>';
+  const hot=Math.abs(c.z)>=2?(c.z>0?'zhot':'zcool'):'';
+  return `<span class="zcell ${hot}">${c.z>0?'+':''}${c.z.toFixed(1)}σ</span>`+
+         `<span class="zmove">${moveTxt(s,c.move)}</span>`;
 }
 function spark(vals){
   if(!vals||vals.length<2)return'';
@@ -157,6 +162,7 @@ function spark(vals){
 
 function render(){
   const d=DATA;
+  const horizons=d.horizons||[{key:'1d'},{key:'1w'},{key:'1m'},{key:'3m'}];
   document.getElementById('asof').textContent='as of '+d.as_of+' · '+(d.data_source==='bbg'?'Bloomberg':'FRED/Stooq')+' · fetched in '+d.generated_in_s+'s';
   document.getElementById('zthresh').textContent=d.outsized_z;
 
@@ -177,13 +183,13 @@ function render(){
      <td>${c.previous.toFixed(2)} → <b>${c.current.toFixed(2)}</b></td></tr>`).join('')
     ||'<tr><td class="small">No pairs computable.</td></tr>';
 
-  // movers
+  // movers (vol-adjusted 1d)
   document.getElementById('movers').innerHTML=d.movers.length?d.movers.map(s=>{
     const riskUp=(s.z_1d>0)!==s.invert_for_risk;
     return `<div class="mover ${riskUp?'upz':''}">
       <div class="mn">${s.name}</div>
       <div class="mz">${s.z_1d>0?'+':''}${s.z_1d.toFixed(1)}σ</div>
-      <div class="md">${chgTxt(s,s.chg_1d)} on the day · ${s.date}</div></div>`;
+      <div class="md">${moveTxt(s,s.chg_1d)} on the day · ${s.date}</div></div>`;
   }).join(''):'<div class="small">No move beyond threshold at the last close — a quiet tape.</div>';
 
   // tabs + table
@@ -193,15 +199,23 @@ function render(){
 
   const rows=d.series.filter(s=>activeTab==='all'||s.asset_class===activeTab);
   document.getElementById('mkttable').innerHTML=
-    `<tr><th>Series</th><th>Last</th><th>1d</th><th>z 1d</th><th>5d</th><th>z 5d</th><th>YTD</th><th>3y %ile</th><th>60d</th></tr>`+
+    `<tr><th>Series</th><th>Last</th>`+
+    horizons.map(h=>`<th>${h.key}</th>`).join('')+
+    `<th>YTD</th><th>3y %ile</th><th>60d</th></tr>`+
     rows.map(s=>`<tr class="${s.stale?'stale':''}">
       <td>${s.name} <span class="small">${s.region}${s.stale?' · stale':''}</span></td>
       <td>${fmt(s.last,s.kind==='oas'?0:2)}<span class="small"> ${s.unit}</span></td>
-      <td class="${cls(s.chg_1d)}">${chgTxt(s,s.chg_1d)}</td><td>${zCell(s.z_1d)}</td>
-      <td class="${cls(s.chg_5d)}">${chgTxt(s,s.chg_5d)}</td><td>${zCell(s.z_5d)}</td>
-      <td class="${cls(s.chg_ytd)}">${chgTxt(s,s.chg_ytd)}</td>
+      ${horizons.map(h=>`<td>${hCell(s,h.key)}</td>`).join('')}
+      <td class="${cls(s.chg_ytd)}">${moveTxt(s,s.chg_ytd)}</td>
       <td>${s.pctile_3y==null?'–':s.pctile_3y+'%'}</td>
       <td>${spark(s.spark)}</td></tr>`).join('');
+
+  document.getElementById('method').textContent=
+    'Vol-adjusted moves: each horizon’s move divided by realised daily vol '+
+    '('+(d.vol_window||63)+'-trading-day window ending before the move starts) '+
+    'scaled by √horizon, so every cell reads in standard deviations. '+
+    '|z| ≥ 2 is highlighted; sign follows the direction of the move, not risk-on/off. '+
+    'Yields, spreads and the VIX move in bp/points; everything else in %.';
 
   document.getElementById('errors').innerHTML=d.errors.length?
     '⚠ '+d.errors.length+' series unavailable: '+d.errors.map(e=>e.split(':')[0]).join(', ')+
