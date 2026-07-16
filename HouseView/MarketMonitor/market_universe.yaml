@@ -1,0 +1,120 @@
+# Market Monitor universe
+# ------------------------
+# data_source: bbg (Bloomberg blpapi, primary — runs on the Terminal machine)
+#              web (FRED + Stooq fallback; blocked by the corporate proxy,
+#                   works from home / non-corporate networks)
+#
+# Each series: name, kind, asset_class, region, unit,
+#              bbg (Bloomberg ticker), and optional web source/symbol.
+#   kind: price  -> % changes            (equities, FX, commodities)
+#         yield  -> changes in bp        (yields, breakevens, curve spreads)
+#         oas    -> credit spreads, shown in bp
+#         level  -> point changes        (VIX)
+# Units are auto-normalised: yield/oas series quoted in bp at source
+# (e.g. USYC2Y10) are detected and converted, so mixing conventions is safe.
+#   invert_for_risk: true where a RISE is risk-negative (spreads, VIX)
+#
+# Run `python verify_universe.py` once as the validation gate (like
+# diagnose_bbg.py). Failures are reported and skipped — never fatal.
+
+settings:
+  data_source: bbg
+  bbg_host: localhost
+  bbg_port: 8194
+  history_start_days: 1300        # ~3.5y of calendar days fetched
+  zscore_lookback: 252            # trading days for move standardisation
+  trend_window: 63                # ~3m, used for regime composites and correlation windows
+  cache_ttl_minutes: 15
+  cache_file: market_cache.json
+  outsized_z: 2.0
+  corr_shift_flag: 0.40
+  stale_after_bdays: 5
+  # web-mode only: uncomment if a proxy is required for outbound HTTPS
+  # proxy: "http://proxy.company.com:8080"
+
+series:
+  # ---- Rates & curves -----------------------------------------------------
+  - {name: "US 2y",             kind: yield, asset_class: rates, region: US, unit: "%",
+     bbg: "USGG2YR Index",      source: fred,  symbol: DGS2}
+  - {name: "US 10y",            kind: yield, asset_class: rates, region: US, unit: "%",
+     bbg: "USGG10YR Index",     source: fred,  symbol: DGS10}
+  - {name: "US 30y",            kind: yield, asset_class: rates, region: US, unit: "%",
+     bbg: "USGG30YR Index",     source: fred,  symbol: DGS30}
+  - {name: "US 2s10s",          kind: yield, asset_class: rates, region: US, unit: "%",
+     bbg: "USYC2Y10 Index",     source: fred,  symbol: T10Y2Y}          # bbg quotes in bp — auto-normalised
+  - {name: "US 10y real",       kind: yield, asset_class: rates, region: US, unit: "%",
+     bbg: "USGGT10Y Index",     source: fred,  symbol: DFII10}
+  - {name: "US 10y breakeven",  kind: yield, asset_class: rates, region: US, unit: "%",
+     bbg: "USGGBE10 Index",     source: fred,  symbol: T10YIE}
+  - {name: "US 5y breakeven",   kind: yield, asset_class: rates, region: US, unit: "%",
+     bbg: "USGGBE05 Index",     source: fred,  symbol: T5YIE}
+  - {name: "UK 10y gilt",       kind: yield, asset_class: rates, region: UK, unit: "%",
+     bbg: "GUKG10 Index"}
+  - {name: "German 10y bund",   kind: yield, asset_class: rates, region: EU, unit: "%",
+     bbg: "GDBR10 Index"}
+
+  # ---- Equities & vol -----------------------------------------------------
+  - {name: "S&P 500",           kind: price, asset_class: equities, region: US, unit: "idx",
+     bbg: "SPX Index",          source: stooq, symbol: "^spx", fallback: {source: fred, symbol: SP500}}
+  - {name: "Nasdaq 100",        kind: price, asset_class: equities, region: US, unit: "idx",
+     bbg: "NDX Index",          source: stooq, symbol: "^ndq", fallback: {source: fred, symbol: NASDAQ100}}
+  - {name: "FTSE 100",          kind: price, asset_class: equities, region: UK, unit: "idx",
+     bbg: "UKX Index",          source: stooq, symbol: "^ukx"}
+  - {name: "Euro Stoxx 50",     kind: price, asset_class: equities, region: EU, unit: "idx",
+     bbg: "SX5E Index"}
+  - {name: "Nikkei 225",        kind: price, asset_class: equities, region: JP, unit: "idx",
+     bbg: "NKY Index",          source: stooq, symbol: "^nkx"}
+  - {name: "VIX",               kind: level, asset_class: equities, region: US, unit: "pts", invert_for_risk: true,
+     bbg: "VIX Index",          source: fred,  symbol: VIXCLS}
+
+  # ---- FX & commodities ---------------------------------------------------
+  - {name: "Dollar index",      kind: price, asset_class: fx, region: US, unit: "idx",
+     bbg: "DXY Curncy",         source: fred,  symbol: DTWEXBGS}
+  - {name: "EUR/USD",           kind: price, asset_class: fx, region: EU, unit: "$",
+     bbg: "EURUSD Curncy",      source: fred,  symbol: DEXUSEU}
+  - {name: "GBP/USD",           kind: price, asset_class: fx, region: UK, unit: "$",
+     bbg: "GBPUSD Curncy",      source: fred,  symbol: DEXUSUK}
+  - {name: "USD/JPY",           kind: price, asset_class: fx, region: JP, unit: "¥",
+     bbg: "USDJPY Curncy",      source: fred,  symbol: DEXJPUS}
+  - {name: "Brent",             kind: price, asset_class: commodities, region: GL, unit: "$/bbl",
+     bbg: "CO1 Comdty",         source: fred,  symbol: DCOILBRENTEU}
+  - {name: "WTI",               kind: price, asset_class: commodities, region: US, unit: "$/bbl",
+     bbg: "CL1 Comdty",         source: fred,  symbol: DCOILWTICO}
+  - {name: "Gold",              kind: price, asset_class: commodities, region: GL, unit: "$/oz",
+     bbg: "XAU Curncy",         source: stooq, symbol: xauusd}
+  - {name: "Copper",            kind: price, asset_class: commodities, region: GL, unit: "$/lb",
+     bbg: "HG1 Comdty",         source: stooq, symbol: hg.f}
+
+  # ---- Credit -------------------------------------------------------------
+  - {name: "US IG OAS",         kind: oas, asset_class: credit, region: US, unit: "bp", invert_for_risk: true,
+     bbg: "LUACOAS Index",      source: fred,  symbol: BAMLC0A0CM}
+  - {name: "US HY OAS",         kind: oas, asset_class: credit, region: US, unit: "bp", invert_for_risk: true,
+     bbg: "LF98OAS Index",      source: fred,  symbol: BAMLH0A0HYM2}
+  - {name: "Euro HY OAS",       kind: oas, asset_class: credit, region: EU, unit: "bp", invert_for_risk: true,
+     bbg: "LP01OAS Index",      source: fred,  symbol: BAMLHE00EHYIOAS}   # VERIFY bbg ticker
+
+# ---- Regime composites -----------------------------------------------------
+# Growth and inflation composites are the mean z-score of ~3m (trend_window)
+# changes in the members below, standardised against their own 3y history of
+# 3m changes. Members that failed to fetch are simply excluded.
+regime:
+  growth:
+    - {name: "S&P 500",   weight: 1.0}
+    - {name: "US HY OAS", weight: -1.0}     # tighter spreads = better growth
+    - {name: "Copper",    weight: 1.0}
+    - {name: "US 2s10s",  weight: 0.5}      # re-steepening from cuts-priced-out counts modestly toward growth
+  inflation:
+    - {name: "US 10y breakeven", weight: 1.0}
+    - {name: "US 5y breakeven",  weight: 1.0}
+    - {name: "Brent",            weight: 0.75}
+    - {name: "Gold",             weight: 0.25}
+  # quadrant thresholds on composite scores
+  threshold: 0.25
+
+# ---- Cross-asset correlation pairs -----------------------------------------
+# Rolling correlation of daily changes over trend_window vs the prior window.
+correlation_pairs:
+  - {a: "S&P 500", b: "US 10y", label: "Equity–bond (SPX vs 10y yield)"}
+  - {a: "Dollar index", b: "Gold", label: "Dollar–gold"}
+  - {a: "S&P 500", b: "US HY OAS", label: "Equity–credit (SPX vs HY OAS)"}
+  - {a: "US 10y", b: "Dollar index", label: "Rates–dollar"}
