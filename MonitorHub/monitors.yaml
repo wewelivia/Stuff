@@ -1,0 +1,41 @@
+# MonitorHub configuration
+# ------------------------
+# One entry per dashboard backend. Place the MonitorHub folder NEXT TO your
+# three project folders and adjust `dir` paths (relative to this file, or
+# absolute — Windows paths like C:\Dashboards\HouseView work too).
+#
+#   name : label used in log prefixes and the hub page
+#   dir  : working directory of that project (where its app module lives)
+#   app  : ASGI app in uvicorn notation, module:attribute
+#   port : port for this backend (must all differ)
+#
+# Optional per monitor:
+#   host    : bind address (default 0.0.0.0 so the Mac can reach the Windows box)
+#   python  : path to a specific interpreter, for apps living in a different
+#             conda env, e.g. C:\devhome\data\miniconda\envs\other_env\python.exe
+#             (default: the python that runs run_all.py)
+#   command : full custom command overriding uvicorn, as a list
+#
+# Rule of thumb: `dir` is the folder you normally cd to before launching,
+# and `app` is exactly the string you normally type after `uvicorn`.
+# e.g. if you run `uvicorn app.main:app` from OptProb\backend, then
+# dir: ../OptProb/backend and app: app.main:app — NOT dir ...\backend\app.
+
+host: 0.0.0.0
+
+monitors:
+  - name: view-challenges          # economic data vs house view
+    dir: ../HouseView
+    app: app:app
+    port: 8000
+
+  - name: market-monitor           # macro regime / outsized moves
+    dir: ../MarketMonitor
+    app: market_monitor_api:app
+    port: 8010
+
+  - name: option-implied           # option-implied monitor
+    dir: ../OptProb/backend        # the folder you normally cd to
+    app: app.main:app              # what you normally type after `uvicorn`
+    port: 8020
+    # python: C:\devhome\data\miniconda\envs\OTHER_ENV\python.exe   # if it uses a different env
