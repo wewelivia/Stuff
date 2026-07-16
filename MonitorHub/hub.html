@@ -56,9 +56,11 @@ code{background:var(--panel);border:1px solid var(--line);border-radius:5px;padd
 //                                 the link becomes http://<host>:<port>/
 //                                 (use this when opening the file directly
 //                                 loses all CSS/JS formatting)
+//   path: '/page.html'         -> optional, with served: deep-link to a
+//                                 specific page instead of the root
 const MONITORS=[
   {name:'View Challenges', desc:'Economic releases scored against the house view — challenge, confirm or neutral across six themes.', port:8000, served:true},
-  {name:'Market Monitor', desc:'What is moving markets, outsized moves vs 1y vol, correlation shifts and the growth/inflation regime quadrant.', port:8010, html:'../MarketMonitor/market-monitor.html'},
+  {name:'Market Monitor', desc:'Growth/inflation regime quadrant, correlation shifts and vol-adjusted cross-asset moves over 1d, 1w, 1m and 3m — every move in standard deviations.', port:8010, html:'../MarketMonitor/market-monitor.html'},
   {name:'Option Implied', desc:'Option-implied market monitor.', port:8020, served:true},
 ];
 // -----------------------------------------------------------------------
@@ -87,7 +89,7 @@ document.getElementById('cards').innerHTML=MONITORS.map((m,i)=>`
 
 function setLinks(){
   MONITORS.forEach((m,i)=>{
-    if(m.served)document.getElementById('open'+i).href=`http://${host()}:${m.port}/`;
+    if(m.served)document.getElementById('open'+i).href=`http://${host()}:${m.port}${m.path||'/'}`;
   });
 }
 setLinks();
