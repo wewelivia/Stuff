@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>House View — Market Monitor</title>
+<style>
+:root{
+  --bg:#f5f6f8; --panel:#ffffff; --ink:#1a1d24; --muted:#69707d; --line:#e3e6ea;
+  --accent:#00aeef; --up:#0e8a4a; --down:#c0392b; --warn:#b7791f;
+  --chip:#eef1f4; --z-hot:#fdecea; --z-cool:#e8f5ee;
+}
+[data-theme="dark"]{
+  --bg:#0f1216; --panel:#171b21; --ink:#e8eaee; --muted:#8b93a1; --line:#262c35;
+  --accent:#00aeef; --up:#3ecf8e; --down:#ef6a5a; --warn:#e2b23a;
+  --chip:#1f252d; --z-hot:#3a2320; --z-cool:#1c2f26;
+}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.45 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--ink)}
+header{display:flex;align-items:center;gap:14px;padding:14px 22px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+header h1{font-size:17px;margin:0;font-weight:650}
+header .asof{color:var(--muted);font-size:12px}
+header .spacer{flex:1}
+button,select{font:inherit;color:var(--ink);background:var(--chip);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+main{max-width:1180px;margin:0 auto;padding:20px 22px 60px}
+.grid{display:grid;gap:16px}
+.cards{grid-template-columns:2fr 1fr}
+@media(max-width:900px){.cards{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.panel h2{margin:0 0 10px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.quad{display:flex;gap:18px;align-items:center}
+.quadmap{flex:0 0 150px;height:150px;position:relative;border:1px solid var(--line);border-radius:10px;
+  background:linear-gradient(to top right, transparent, transparent)}
+.quadmap .axis{position:absolute;background:var(--line)}
+.quadmap .h{left:0;right:0;top:50%;height:1px}.quadmap .v{top:0;bottom:0;left:50%;width:1px}
+.quadmap .dot{position:absolute;width:14px;height:14px;border-radius:50%;background:var(--accent);
+  border:2px solid var(--panel);box-shadow:0 0 0 2px var(--accent);transform:translate(-50%,50%)}
+.quadmap .lbl{position:absolute;font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.qname{font-size:21px;font-weight:700;text-transform:capitalize;margin:0 0 6px}
+.qdesc{color:var(--muted);margin:0 0 10px}
+.scores span{display:inline-block;background:var(--chip);border-radius:6px;padding:3px 10px;margin-right:8px;font-size:12px}
+.corr{width:100%;border-collapse:collapse;font-size:13px}
+.corr td{padding:6px 4px;border-top:1px solid var(--line)}
+.corr td:last-child{text-align:right}
+.flag{color:var(--warn);font-weight:650}
+.movers{display:flex;flex-wrap:wrap;gap:10px}
+.mover{border:1px solid var(--line);border-left:4px solid var(--down);border-radius:10px;padding:10px 14px;min-width:170px;background:var(--panel)}
+.mover.upz{border-left-color:var(--up)}
+.mover .mn{font-weight:650}.mover .mz{font-size:19px;font-weight:700}
+.mover .md{color:var(--muted);font-size:12px}
+.tabs{display:flex;gap:8px;margin:22px 0 12px;flex-wrap:wrap}
+.tabs button.active{border-color:var(--accent);color:var(--accent);font-weight:650}
+table.mkt{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;font-size:13px}
+table.mkt th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);text-align:right;padding:9px 10px;border-bottom:1px solid var(--line)}
+table.mkt th:first-child{text-align:left}
+table.mkt td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums}
+table.mkt td:first-child{text-align:left;font-weight:600}
+table.mkt tr:last-child td{border-bottom:none}
+.pos{color:var(--up)}.neg{color:var(--down)}
+.zcell{border-radius:6px;padding:2px 8px;display:inline-block;min-width:46px}
+.zhot{background:var(--z-hot);color:var(--down);font-weight:650}
+.zcool{background:var(--z-cool);color:var(--up);font-weight:650}
+.stale{opacity:.5}
+.small{color:var(--muted);font-size:11px}
+.spark{vertical-align:middle}
+#gear-panel{display:none;position:fixed;right:20px;top:60px;z-index:10;width:320px}
+#gear-panel input{width:100%;font:inherit;padding:7px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);margin:8px 0}
+#status{padding:40px;text-align:center;color:var(--muted)}
+.errbox{margin-top:14px;font-size:12px;color:var(--warn)}
+</style>
+</head>
+<body>
+<header>
+  <h1>Market Monitor</h1>
+  <span class="asof" id="asof"></span>
+  <span class="spacer"></span>
+  <button id="refresh" title="Force refresh (bypasses server cache)">↻ Refresh</button>
+  <button id="theme">◐</button>
+  <button id="gear">⚙</button>
+</header>
+
+<div id="gear-panel" class="panel">
+  <h2>API endpoint</h2>
+  <input id="api-base" placeholder="http://127.0.0.1:8000">
+  <button id="save-api">Save & reload</button>
+  <div class="small">Stored in this browser (hv-api-base). Point at the machine running uvicorn.</div>
+</div>
+
+<main>
+  <div id="status">Loading market data…</div>
+  <div id="content" style="display:none">
+
+    <div class="grid cards">
+      <div class="panel">
+        <h2>Macro regime</h2>
+        <div class="quad">
+          <div class="quadmap" id="quadmap">
+            <div class="axis h"></div><div class="axis v"></div>
+            <div class="lbl" style="top:4px;left:6px">Stagflation</div>
+            <div class="lbl" style="top:4px;right:6px">Reflation</div>
+            <div class="lbl" style="bottom:4px;left:6px">Disinflation</div>
+            <div class="lbl" style="bottom:4px;right:6px">Goldilocks</div>
+            <div class="dot" id="quaddot" style="left:50%;bottom:50%"></div>
+          </div>
+          <div>
+            <p class="qname" id="qname"></p>
+            <p class="qdesc" id="qdesc"></p>
+            <div class="scores">
+              <span id="gscore"></span><span id="iscore"></span><span id="qwin"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Correlation regime (3m vs prior 3m)</h2>
+        <table class="corr" id="corrtable"></table>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h2>Outsized moves (|z| ≥ <span id="zthresh"></span> vs 1y)</h2>
+      <div class="movers" id="movers"></div>
+    </div>
+
+    <div class="tabs" id="tabs"></div>
+    <table class="mkt" id="mkttable"></table>
+    <div class="errbox" id="errors"></div>
+  </div>
+</main>
+
+<script>
+const LSK_API='hv-api-base', LSK_THEME='hv-theme';
+const CLASSES=[['all','All'],['rates','Rates & curves'],['equities','Equities & vol'],['fx','FX'],['commodities','Commodities'],['credit','Credit']];
+let DATA=null, activeTab='all';
+
+function apiBase(){return localStorage.getItem(LSK_API)||'http://127.0.0.1:8000';}
+function fmt(v,dp){return v==null?'–':Number(v).toLocaleString('en-GB',{minimumFractionDigits:dp,maximumFractionDigits:dp});}
+function chgTxt(s,v){
+  if(v==null)return '–';
+  const u=(s.kind==='yield'||s.kind==='oas')?'bp':(s.kind==='level'?'pts':'%');
+  return (v>0?'+':'')+fmt(v,u==='bp'?0:2)+u;
+}
+function cls(v){return v==null?'':(v>0?'pos':'neg');}
+function zCell(z){
+  if(z==null)return '<span class="small">–</span>';
+  const c=Math.abs(z)>=2?(z>0?'zhot':'zcool'):'';
+  return `<span class="zcell ${c}">${z>0?'+':''}${z.toFixed(1)}σ</span>`;
+}
+function spark(vals){
+  if(!vals||vals.length<2)return'';
+  const w=90,h=26,min=Math.min(...vals),max=Math.max(...vals),r=(max-min)||1;
+  const pts=vals.map((v,i)=>`${(i/(vals.length-1)*w).toFixed(1)},${(h-2-(v-min)/r*(h-4)).toFixed(1)}`).join(' ');
+  const col=vals[vals.length-1]>=vals[0]?'var(--up)':'var(--down)';
+  return `<svg class="spark" width="${w}" height="${h}"><polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.5"/></svg>`;
+}
+
+function render(){
+  const d=DATA;
+  document.getElementById('asof').textContent='as of '+d.as_of+' · fetched in '+d.generated_in_s+'s';
+  document.getElementById('zthresh').textContent=d.outsized_z;
+
+  // regime
+  const r=d.regime;
+  document.getElementById('qname').textContent=r.quadrant;
+  document.getElementById('qdesc').textContent=r.description;
+  document.getElementById('gscore').textContent='Growth impulse: '+(r.growth_score==null?'–':(r.growth_score>0?'+':'')+r.growth_score+'σ');
+  document.getElementById('iscore').textContent='Inflation impulse: '+(r.inflation_score==null?'–':(r.inflation_score>0?'+':'')+r.inflation_score+'σ');
+  document.getElementById('qwin').textContent='window: ~3m';
+  const clamp=v=>Math.max(-2,Math.min(2,v||0));
+  document.getElementById('quaddot').style.left=(50+clamp(r.growth_score)*23)+'%';
+  document.getElementById('quaddot').style.bottom=(50+clamp(r.inflation_score)*23)+'%';
+
+  // correlations
+  document.getElementById('corrtable').innerHTML=d.correlations.map(c=>
+    `<tr><td>${c.label}${c.flag?' <span class="flag">⚠'+(c.sign_flip?' sign flip':' shift')+'</span>':''}</td>
+     <td>${c.previous.toFixed(2)} → <b>${c.current.toFixed(2)}</b></td></tr>`).join('')
+    ||'<tr><td class="small">No pairs computable.</td></tr>';
+
+  // movers
+  document.getElementById('movers').innerHTML=d.movers.length?d.movers.map(s=>{
+    const riskUp=(s.z_1d>0)!==s.invert_for_risk;
+    return `<div class="mover ${riskUp?'upz':''}">
+      <div class="mn">${s.name}</div>
+      <div class="mz">${s.z_1d>0?'+':''}${s.z_1d.toFixed(1)}σ</div>
+      <div class="md">${chgTxt(s,s.chg_1d)} on the day · ${s.date}</div></div>`;
+  }).join(''):'<div class="small">No move beyond threshold at the last close — a quiet tape.</div>';
+
+  // tabs + table
+  document.getElementById('tabs').innerHTML=CLASSES.map(([k,l])=>
+    `<button data-k="${k}" class="${k===activeTab?'active':''}">${l}</button>`).join('');
+  document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{activeTab=b.dataset.k;render();});
+
+  const rows=d.series.filter(s=>activeTab==='all'||s.asset_class===activeTab);
+  document.getElementById('mkttable').innerHTML=
+    `<tr><th>Series</th><th>Last</th><th>1d</th><th>z 1d</th><th>5d</th><th>z 5d</th><th>YTD</th><th>3y %ile</th><th>60d</th></tr>`+
+    rows.map(s=>`<tr class="${s.stale?'stale':''}">
+      <td>${s.name} <span class="small">${s.region}${s.stale?' · stale':''}</span></td>
+      <td>${fmt(s.last,s.kind==='oas'?0:2)}<span class="small"> ${s.unit}</span></td>
+      <td class="${cls(s.chg_1d)}">${chgTxt(s,s.chg_1d)}</td><td>${zCell(s.z_1d)}</td>
+      <td class="${cls(s.chg_5d)}">${chgTxt(s,s.chg_5d)}</td><td>${zCell(s.z_5d)}</td>
+      <td class="${cls(s.chg_ytd)}">${chgTxt(s,s.chg_ytd)}</td>
+      <td>${s.pctile_3y==null?'–':s.pctile_3y+'%'}</td>
+      <td>${spark(s.spark)}</td></tr>`).join('');
+
+  document.getElementById('errors').innerHTML=d.errors.length?
+    '⚠ '+d.errors.length+' series unavailable: '+d.errors.map(e=>e.split(':')[0]).join(', ')+
+    ' <span class="small">(run verify_universe.py to fix symbols)</span>':'';
+}
+
+async function load(force){
+  const st=document.getElementById('status');
+  st.style.display='block';document.getElementById('content').style.display='none';
+  st.textContent='Loading market data…';
+  try{
+    const res=await fetch(apiBase()+'/api/market-monitor'+(force?'?refresh=1':''));
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    DATA=await res.json();
+    st.style.display='none';document.getElementById('content').style.display='block';
+    render();
+  }catch(e){
+    st.innerHTML='Could not reach the API at <b>'+apiBase()+'</b> — '+e.message+
+      '.<br><br>Check uvicorn is running, then set the endpoint via ⚙.';
+  }
+}
+
+// chrome
+document.getElementById('theme').onclick=()=>{
+  const t=document.documentElement.dataset.theme==='dark'?'light':'dark';
+  document.documentElement.dataset.theme=t;localStorage.setItem(LSK_THEME,t);
+};
+document.documentElement.dataset.theme=localStorage.getItem(LSK_THEME)||
+  (matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
+document.getElementById('gear').onclick=()=>{
+  const p=document.getElementById('gear-panel');
+  p.style.display=p.style.display==='block'?'none':'block';
+  document.getElementById('api-base').value=apiBase();
+};
+document.getElementById('save-api').onclick=()=>{
+  localStorage.setItem(LSK_API,document.getElementById('api-base').value.replace(/\/$/,''));
+  document.getElementById('gear-panel').style.display='none';load(false);
+};
+document.getElementById('refresh').onclick=()=>load(true);
+load(false);
+</script>
+</body>
+</html>
