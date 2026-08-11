@@ -103,7 +103,11 @@ def main() -> int:
                         enable_bloomberg=app_cfg.get("enable_bloomberg", True),
                         enable_macrobond=app_cfg.get("enable_macrobond", True))
 
-    from providers.cache import BACKEND
+    try:
+        from providers.cache import BACKEND
+    except ImportError:
+        # Older cache.py without the CSV fallback.
+        BACKEND = "parquet (old cache.py, no CSV fallback)"
     print(f"cache: {os.path.abspath(cache_dir)}  ({BACKEND})")
     print(f"{len(pairs)} series across {len({i for i, _ in pairs})} inputs, "
           f"history from {start}\n")
