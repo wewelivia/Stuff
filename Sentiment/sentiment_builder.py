@@ -29,10 +29,14 @@ class BuildReport:
     skipped: Dict[str, str] = field(default_factory=dict)
     substitutes: List[str] = field(default_factory=list)
     degraded: Dict[str, str] = field(default_factory=dict)
+    # Inputs that build but can never produce a percentile, which otherwise
+    # shows in the tab as a silent "unavailable" with no explanation.
+    warnings: Dict[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, object]:
         return {"built": self.built, "skipped": self.skipped,
                 "substitutes": self.substitutes, "degraded": self.degraded,
+                "warnings": self.warnings,
                 "n_built": len(self.built), "n_skipped": len(self.skipped)}
 
 
@@ -116,16 +120,22 @@ class SentimentBuilder:
 
             # A rolling window longer than the series can ever hold produces no
             # percentile at all, which shows up as a permanently missing input.
-            for rule in (entry.get("sell"), entry.get("buy")):
+            available = len(series.dropna())
+            for side, rule in (("sell", entry.get("sell")), ("buy", entry.get("buy"))):
                 converted = _rule(rule, freq)
                 if converted is None or converted.window == "expanding":
                     continue
-                available = len(series.dropna())
                 if converted.window > available:
-                    log.warning(
-                        "%s: %s-observation window exceeds the %d observations available "
-                        "at %s frequency; input will never fire",
-                        iid, converted.window, available, freq)
+                    msg = (f"{side} window is {converted.window} observations but only "
+                           f"{available} exist at {freq} frequency, so no percentile can "
+                           f"be computed and the input will never fire")
+                    report.warnings[iid] = msg
+                    log.warning("%s: %s", iid, msg)
+                elif available < min_periods:
+                    msg = (f"only {available} observations, below the {min_periods} "
+                           f"needed before a percentile is meaningful")
+                    report.warnings.setdefault(iid, msg)
+                    log.warning("%s: %s", iid, msg)
 
             inputs.append(eng.SentimentInput(
                 id=iid, series=series, cluster=self.clusters.get(iid, iid),
