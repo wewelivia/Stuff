@@ -24,4 +24,5 @@ bootstrap: 200
 
 server:
   host: "0.0.0.0"
-  port: 8010
+  # 8000 view-challenges, 8010 market-monitor, 8020 option-implied.
+  port: 8030
