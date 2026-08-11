@@ -101,12 +101,15 @@ def rebuild(refresh: bool = True) -> Dict[str, object]:
             continue
 
         calibrated = stats.calibrate_bands(reading)
-        bands_published = eng.label_bands(res.reading)
+        # Band membership uses the calibrated thresholds. Labelling a continuous
+        # hinge reading with HSBC's 20/30/40/50 puts it in "No signal" almost
+        # always, which says nothing about the reading and everything about the
+        # mismatch in scale.
+        bands = eng.label_bands(res.reading, eng.bands_from_thresholds(calibrated))
         signal = (res.reading >= calibrated.get("Strong", 0.4)).fillna(False)
 
         entry: Dict[str, object] = {
-            "latest": _latest_block(res, reading, bands_published, calibrated,
-                                    published.get(side)),
+            "latest": _latest_block(res, reading, bands, calibrated, published.get(side)),
             "bands": {
                 "published": {"Mild": 0.20, "Moderate": 0.30, "Strong": 0.40, "Extreme": 0.50},
                 "calibrated": calibrated,
@@ -115,8 +118,12 @@ def rebuild(refresh: bool = True) -> Dict[str, object]:
         }
 
         if not prices.empty:
-            entry["evaluation"] = _evaluation_block(prices, res, reading, bands_published,
-                                                    side, cfg)
+            # Redundancy is only defined for the binary count: it inverts a
+            # binomial tail to find an effective input count. Always take it
+            # from the replica, whichever mode is being displayed.
+            replica = results.get(f"{side}_replica")
+            entry["evaluation"] = _evaluation_block(prices, res, reading, bands,
+                                                    side, cfg, replica)
         payload["sides"][key] = entry
 
     payload["_series"] = {k: v.reading for k, v in results.items()}
@@ -168,7 +175,8 @@ def _input_rows(res, last) -> List[Dict[str, object]]:
     return sorted(rows, key=lambda r: (-r.get("hinge", -1), r["id"]))
 
 
-def _evaluation_block(prices, res, reading, bands_published, side, cfg) -> Dict[str, object]:
+def _evaluation_block(prices, res, reading, bands, side, cfg,
+                      replica=None) -> Dict[str, object]:
     horizons = cfg.get("horizons", [21, 63, 126])
     calibrated = stats.calibrate_bands(reading)
     signal = (res.reading >= calibrated.get("Strong", 0.4)).fillna(False)
@@ -182,17 +190,26 @@ def _evaluation_block(prices, res, reading, bands_published, side, cfg) -> Dict[
             log.warning("evaluation failed at horizon %s: %s", h, exc)
 
     headline = int(cfg.get("headline_horizon", 63))
-    table = stats.evaluate_by_band(prices, reading, bands_published, side, headline)
+    table = stats.evaluate_by_band(prices, reading, bands, side, headline)
 
-    denom = res.per_input_rank.shape[1]
-    fire_prob = float(res.fired_count.dropna().mean() / denom) if denom else 0.1
-    redundancy = stats.redundancy_ratio(reading, denom, max(fire_prob, 0.01))
+    # Effective input count comes from the binary count. Inverting a binomial
+    # tail against a continuous hinge reading returns nonsense, typically the
+    # full nominal count.
+    source = replica if replica is not None else res
+    redundancy = None
+    if source.mode == "replica":
+        denom = source.per_input_rank.shape[1]
+        source_reading = source.reading.dropna()
+        if denom and not source_reading.empty:
+            fire_prob = float(source.fired_count.dropna().mean() / denom)
+            redundancy = stats.redundancy_ratio(source_reading, denom, max(fire_prob, 0.01))
 
     return {
         "by_horizon": by_horizon,
         "band_table": _frame_to_records(table),
         "headline_horizon": headline,
         "redundancy": redundancy,
+        "band_source": "calibrated",
     }
 
 
