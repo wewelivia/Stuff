@@ -23,6 +23,7 @@ import pandas as pd
 import yaml
 from fastapi import APIRouter, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 import sentiment_engine as eng
 import sentiment_stats as stats
@@ -257,3 +258,17 @@ app = FastAPI(title="House View Sentiment")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
                    allow_headers=["*"])
 app.include_router(router)
+
+
+@app.get("/", include_in_schema=False)
+def index() -> FileResponse:
+    """Serve the tab from the backend.
+
+    Lets the hub use `served: true`, which means the page finds its own API at
+    window.location.origin with no endpoint configuration, and the hub link
+    does not depend on a relative path into this folder.
+    """
+    page = os.path.join(HERE, "sentiment.html")
+    if not os.path.exists(page):
+        raise HTTPException(status_code=404, detail="sentiment.html not found")
+    return FileResponse(page, media_type="text/html")
