@@ -61,7 +61,7 @@ dialog input{width:100%;padding:7px;border:1px solid var(--line);border-radius:6
 </head>
 <body>
 <header>
-  <h1>Sentiment Indicator</h1>
+  <h1>Sentiment Indicator <span class="sub" id="build" style="font-weight:400">v2</span></h1>
   <select id="side"><option value="sell">Sell signals</option><option value="buy">Buy signals</option></select>
   <select id="mode"><option value="replica">Replica (binary count)</option>
                     <option value="improved">Improved (cluster hinge)</option></select>
@@ -145,10 +145,57 @@ function alertBox(msg,isErr){
   const d=document.createElement('div');
   d.className='notice'+(isErr?' err':'');d.textContent=msg;$('alerts').appendChild(d);}
 
+let pollTimer=null;
+
+function setStatus(msg){
+  $('reading').textContent='—';
+  $('readingSub').textContent=msg;
+}
+
+async function pollStatus(){
+  try{
+    const r=await fetch(apiBase()+'/api/sentiment/status');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const s=await r.json();
+
+    if(s.ready){
+      clearInterval(pollTimer); pollTimer=null;
+      await load(false);
+      return;
+    }
+    if(s.error){
+      clearInterval(pollTimer); pollTimer=null;
+      $('alerts').innerHTML='';
+      alertBox('Build failed: '+s.error,true);
+      setStatus('build failed');
+      return;
+    }
+    const since=s.started?Math.round((Date.now()-new Date(s.started))/1000):0;
+    setStatus('Building: '+(s.stage||'working')+
+      (since?' · '+(since<90?since+'s':Math.round(since/60)+'m')+' elapsed':''));
+  }catch(e){
+    clearInterval(pollTimer); pollTimer=null;
+    alertBox('Could not reach the API at '+apiBase()+'. '+e.message+
+             '  Use the gear icon to set the endpoint.',true);
+    setStatus('no connection');
+  }
+}
+
+function startPolling(){
+  if(pollTimer) return;
+  $('alerts').innerHTML='';
+  alertBox('First build fetches around sixty series from Bloomberg and Macrobond '+
+           'and takes several minutes. Running warm_cache.py beforehand avoids this wait.');
+  setStatus('Building…');
+  pollStatus();
+  pollTimer=setInterval(pollStatus,3000);
+}
+
 async function load(refresh){
   $('alerts').innerHTML='';
   try{
     const r=await fetch(apiBase()+'/api/sentiment/'+(refresh?'?refresh=true':''));
+    if(r.status===202){ startPolling(); return; }
     if(!r.ok) throw new Error('HTTP '+r.status);
     payload=await r.json();
     render();
@@ -156,6 +203,7 @@ async function load(refresh){
   }catch(e){
     alertBox('Could not reach the API at '+apiBase()+'. '+e.message+
              '  Use the gear icon to set the endpoint.',true);
+    setStatus('no connection');
   }
 }
 
