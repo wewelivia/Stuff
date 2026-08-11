@@ -209,6 +209,9 @@ async function load(refresh){
 
 function render(){
   if(!payload) return;
+  // Cleared here rather than only in load(), because the side and mode
+  // dropdowns call render() directly and alerts would otherwise accumulate.
+  $('alerts').innerHTML='';
   $('stamp').textContent='Updated '+(payload.generated||'').replace('T',' ');
 
   const b=payload.build||{};
@@ -271,7 +274,7 @@ function renderLift(side){
     'Lift is conditional minus base rate. t-statistics use Newey-West with the lag '+
     'matched to the return overlap; n eff is the independent-equivalent sample. '+
     (ev.redundancy?('Redundancy: '+Math.round(ev.redundancy.effective_k)+' effective inputs of '+
-      Math.round(ev.redundancy.nominal_k)+'.'):'')+'</div>';
+      Math.round(ev.redundancy.nominal_k)+', measured on the binary count.'):'')+'</div>';
 }
 
 function renderInputs(rows){
@@ -300,7 +303,8 @@ function renderBands(side){
     '<td class="num '+(r.lift>0?'pos':'neg')+'">'+signed(r.lift)+'</td>'+
     '<td class="num">'+Math.round(r.n_effective||0)+'</td></tr>').join('');
   $('bandNote').textContent='Horizon '+((side.evaluation||{}).headline_horizon||63)+
-    ' trading days. Bands marked thin rest on fewer than ten independent observations.';
+    ' trading days, using calibrated thresholds rather than the published ones. '+
+    'Bands marked thin rest on fewer than ten independent observations.';
 }
 
 async function drawChart(){
