@@ -9,9 +9,11 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 VALID_SOURCES = ("bloomberg", "macrobond", "derived")
-VALID_FREQ = ("daily", "weekly", "monthly")
+# semimonthly covers Bloomberg SHORT_INT, which reports around 24 times a year.
+VALID_FREQ = ("daily", "weekly", "semimonthly", "monthly")
 
-STALENESS_LIMIT_DAYS: Dict[str, int] = {"daily": 7, "weekly": 21, "monthly": 60}
+STALENESS_LIMIT_DAYS: Dict[str, int] = {
+    "daily": 7, "weekly": 21, "semimonthly": 45, "monthly": 60}
 
 
 @dataclass(frozen=True)
