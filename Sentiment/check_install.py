@@ -37,6 +37,27 @@ CHECKS = {
 OPTIONAL = {"requirements.txt", "README.md", "run_sentiment.bat", ".gitignore"}
 
 
+def stale_bytecode() -> list:
+    """Find .pyc files at least as new as their source.
+
+    Copying with timestamps preserved can leave bytecode that Python considers
+    current, so an updated .py is ignored and the symptom is an ImportError for
+    something the source clearly defines.
+    """
+    found = []
+    for root, dirs, files in os.walk(HERE):
+        if os.path.basename(root) != "__pycache__":
+            continue
+        for name in files:
+            if not name.endswith(".pyc"):
+                continue
+            source = os.path.join(os.path.dirname(root), name.split(".")[0] + ".py")
+            pyc = os.path.join(root, name)
+            if os.path.exists(source) and os.path.getmtime(pyc) >= os.path.getmtime(source):
+                found.append(os.path.relpath(pyc, HERE))
+    return found
+
+
 def main() -> int:
     missing, stale, ok = [], [], []
 
@@ -64,11 +85,24 @@ def main() -> int:
         if not os.path.exists(os.path.join(HERE, rel)):
             print(f"  note     {rel:<38} not present (optional)")
 
+    bytecode = stale_bytecode()
+    if bytecode:
+        print()
+        print(f"  WARNING  {len(bytecode)} cached .pyc file(s) at least as new as their source.")
+        for b in bytecode[:6]:
+            print(f"           {b}")
+        print("           Python may load these instead of the updated files.")
+        print("           Clear them, from this folder:")
+        print('             for /d /r . %d in (__pycache__) do @if exist "%d" rd /s /q "%d"')
+
     print()
-    if not stale and not missing:
+    if not stale and not missing and not bytecode:
         print(f"All {len(ok)} files current.")
         print("Next: python warm_cache.py")
         return 0
+    if not stale and not missing:
+        print(f"All {len(ok)} files current, but clear the bytecode above first.")
+        return 1
 
     print(f"{len(ok)} current, {len(stale)} out of date, {len(missing)} missing.")
     print("Copy the listed files from the Sentiment folder and re-run this check.")
