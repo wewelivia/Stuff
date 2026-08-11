@@ -109,7 +109,7 @@ inputs:
   - id: short_interest_equity_etfs
     name: "Short interest, large equity ETFs"
     hsbc_ref: 5
-    frequency: daily
+    frequency: semimonthly
     compute: {op: level, smooth: {op: rolling_mean, months: 1}, post: {op: diff, horizon: 3M}}
     sell: {rule: lt, pct: 10, window: {rolling_years: 5}}
     buy: null
@@ -118,11 +118,15 @@ inputs:
         field: SHORT_INT
         candidates: ["SPY US Equity", "QQQ US Equity", "IWM US Equity",
                      "VTI US Equity", "IVV US Equity"]
+    notes: >
+      SHORT_INT reports about 24 times a year, 497 observations since 2004. At
+      daily frequency the 5-year window converts to 1,260 observations, more
+      than the series will ever hold, and the input never fires.
 
   - id: short_interest_equity_bond_etfs
     name: "Short interest, equity and bond ETFs"
     hsbc_ref: 6
-    frequency: daily
+    frequency: semimonthly
     compute: {op: level, smooth: {op: rolling_mean, months: 1}, post: {op: diff, horizon: 12M}}
     sell: {rule: lt, pct: 10, window: {rolling_years: 5}}
     buy: null
