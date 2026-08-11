@@ -213,8 +213,11 @@ function render(){
 
   const b=payload.build||{};
   if(b.skipped && Object.keys(b.skipped).length)
-    alertBox('Inputs unavailable: '+Object.keys(b.skipped).join(', ')+
-             '. The denominator below is reduced accordingly.');
+    alertBox('Inputs failed to build: '+Object.entries(b.skipped)
+             .map(([k,v])=>k+' ('+v+')').join('; '),true);
+  if(b.warnings && Object.keys(b.warnings).length)
+    alertBox('Inputs that cannot fire: '+Object.entries(b.warnings)
+             .map(([k,v])=>k+' — '+v).join('; '),true);
   if(b.substitutes && b.substitutes.length)
     alertBox('Substitute inputs in use: '+b.substitutes.join(', ')+
              '. These approximate the published construction rather than reproduce it.');
