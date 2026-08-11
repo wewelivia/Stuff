@@ -39,3 +39,11 @@ monitors:
     app: app.main:app              # what you normally type after `uvicorn`
     port: 8020
     # python: C:\devhome\data\miniconda\envs\OTHER_ENV\python.exe   # if it uses a different env
+
+  - name: sentiment                # HSBC-style multi-asset sentiment indicator
+    dir: ../Sentiment
+    app: api_sentiment:app
+    port: 8030
+    # Needs Bloomberg (Terminal logged in) and Macrobond (desktop application
+    # running and signed in, since it hosts the COM server). Missing either
+    # degrades to fewer inputs rather than failing; check /api/sentiment/health.
