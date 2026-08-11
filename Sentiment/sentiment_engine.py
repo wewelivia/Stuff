@@ -14,17 +14,21 @@ import pandas as pd
 TRADING_DAYS_PER_MONTH = 21
 WEEKS_PER_MONTH = 4.348
 
+# Observations per month by frequency. Horizons in the config are expressed in
+# months and must convert on the series' own frequency: at semi-monthly, three
+# months is six observations, not thirteen.
+OBS_PER_MONTH = {"daily": TRADING_DAYS_PER_MONTH, "weekly": WEEKS_PER_MONTH,
+                 "semimonthly": 2.0, "monthly": 1.0}
+
 
 # --- transforms ------------------------------------------------------------
 def diff_horizon(s: pd.Series, months: float, freq: str = "daily") -> pd.Series:
-    per_month = TRADING_DAYS_PER_MONTH if freq == "daily" else WEEKS_PER_MONTH
-    lag = max(int(round(months * per_month)), 1)
+    lag = max(int(round(months * OBS_PER_MONTH.get(freq, WEEKS_PER_MONTH))), 1)
     return s - s.shift(lag)
 
 
 def smooth(s: pd.Series, months: float, freq: str = "daily") -> pd.Series:
-    per_month = TRADING_DAYS_PER_MONTH if freq == "daily" else WEEKS_PER_MONTH
-    window = max(int(round(months * per_month)), 1)
+    window = max(int(round(months * OBS_PER_MONTH.get(freq, WEEKS_PER_MONTH))), 1)
     return s.rolling(window, min_periods=max(window // 2, 1)).mean()
 
 
