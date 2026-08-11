@@ -1,0 +1,27 @@
+# Application settings for the sentiment tab.
+
+# Cache location. Keep this on a local unsynced path: OneDrive-backed folders
+# corrupt parquet and SQLite on concurrent write.
+cache_dir: "C:/devhome/data/cache/sentiment"
+
+enable_bloomberg: true
+enable_macrobond: true
+
+# Benchmark used for all lift and base-rate calculations.
+benchmark:
+  source: bloomberg
+  code: "SPX Index"
+  field: PX_LAST
+
+# Forward-return horizons in trading days. 21 / 63 / 126 is one, three and six
+# months. Evaluating several guards against a signal that works at exactly one
+# horizon and nowhere near it.
+horizons: [21, 63, 126]
+headline_horizon: 63
+
+# Bootstrap replications for lift confidence intervals and band thresholds.
+bootstrap: 200
+
+server:
+  host: "0.0.0.0"
+  port: 8010

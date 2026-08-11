@@ -1,0 +1,379 @@
+# Input definitions for the sentiment indicator.
+#
+# Source: HSBC Global Research, "Sentiment shape up", Multi-Asset Global,
+# 5 March 2024. Rule set reproduces the published 20 sell / 13 buy inputs.
+#
+# Series codes verified against Bloomberg and Macrobond, August 2026. The CFTC
+# codes were cross-checked against the CFTC public API: cftc_cme13874a_8o/_9o/_7o
+# returned 289,619 / 296,567 / 3,170,383 for report date 2026-08-04, matching
+# the CFTC figures exactly.
+
+meta:
+  version: "1.0"
+  hsbc_source: "Sentiment shape up, HSBC Multi-Asset Global, 5 March 2024"
+  sell_inputs_published: 20
+  buy_inputs_published: 13
+
+defaults:
+  field: PX_LAST
+  history_start: "2004-01-01"
+  min_history_years: 5
+
+engine:
+  modes:
+    replica:
+      aggregation: binary_count
+      weighting: equal
+    improved:
+      aggregation: continuous_hinge
+      weighting: correlation_cluster
+      robust_scaling: median_mad
+      winsorise_at: 3.0
+
+inputs:
+
+  - id: cta_equity_beta
+    name: "Leveraged fund equity positioning"
+    ui_label: "Leveraged fund equity positioning (substitute for CTA beta)"
+    hsbc_ref: 1
+    frequency: weekly
+    is_substitute: true
+    compute: {op: level, post: {op: diff, horizon: 3M}}
+    sell: {rule: gt, pct: 90, window: expanding}
+    buy:  {rule: lt, pct: 10, window: expanding}
+    macrobond:
+      series: "cftc_cme13874a_14otnet"
+      open_interest: "cftc_cme13874a_7o"
+      release_lag_days: 3
+      normalise_by_open_interest: true
+      # Leveraged funds run a structural short in E-mini against asset manager
+      # longs (cash equitisation). The level is mechanical and carries no
+      # sentiment content; only the change is informative.
+      require_difference: true
+    notes: >
+      HSBC use a rolling beta. This is net positioning, which measures the same
+      exposure by a different route. Barclay Hedge CTA indices were rejected:
+      monthly frequency and a 71-day publication lag.
+
+  - id: us_equity_fund_beta
+    name: "US equity fund beta"
+    hsbc_ref: 2
+    frequency: daily
+    compute: {op: rolling_beta, window_days: 20, post: {op: diff, horizon: 3M}}
+    sell: {rule: gt, pct: 90, window: expanding}
+    buy: null
+    series:
+      - role: dependent_basket
+        field: FUND_NET_ASSET_VAL
+        candidates: ["AGTHX US Equity", "FCNTX US Equity", "TRBCX US Equity",
+                     "AIVSX US Equity", "DODGX US Equity"]
+      - role: factor
+        candidates: ["SPX Index"]
+    notes: "Fixed fund basket; survivorship-biased by construction."
+
+  - id: us_multi_asset_fund_equity_beta
+    name: "US multi-asset fund equity beta"
+    hsbc_ref: 3
+    frequency: daily
+    compute: {op: rolling_beta, window_days: 20, post: {op: diff, horizon: 3M}}
+    sell: {rule: gt, pct: 90, window: expanding}
+    buy:  {rule: lt, pct: 10, window: expanding}
+    series:
+      - role: dependent_basket
+        field: FUND_NET_ASSET_VAL
+        candidates: ["ABALX US Equity", "AMECX US Equity", "VBIAX US Equity",
+                     "PRWCX US Equity", "DODBX US Equity"]
+      - role: factor
+        candidates: ["SPX Index"]
+
+  - id: cta_usd_beta
+    name: "Leveraged fund USD positioning"
+    ui_label: "Leveraged fund USD positioning (substitute for CTA USD beta)"
+    hsbc_ref: 4
+    frequency: weekly
+    is_substitute: true
+    compute: {op: level, post: {op: diff, horizon: 3M}}
+    sell: {rule: gt, pct: 80, window: {rolling_years: 1}}
+    buy: null
+    macrobond:
+      series: "cftc_icus098662_14otnet"
+      open_interest: "cftc_icus098662_7o"
+      release_lag_days: 3
+      normalise_by_open_interest: true
+      require_difference: true
+    notes: >
+      Thin market: net positioning near 3,800 contracts against open interest
+      around 52,000. Noisier than the equity equivalent. Longer-history
+      alternative is legacy non-commercial from 1992 (_8o minus _9o).
+
+  - id: short_interest_equity_etfs
+    name: "Short interest, large equity ETFs"
+    hsbc_ref: 5
+    frequency: daily
+    compute: {op: level, smooth: {op: rolling_mean, months: 1}, post: {op: diff, horizon: 3M}}
+    sell: {rule: lt, pct: 10, window: {rolling_years: 5}}
+    buy: null
+    series:
+      - role: basket
+        field: SHORT_INT
+        candidates: ["SPY US Equity", "QQQ US Equity", "IWM US Equity",
+                     "VTI US Equity", "IVV US Equity"]
+
+  - id: short_interest_equity_bond_etfs
+    name: "Short interest, equity and bond ETFs"
+    hsbc_ref: 6
+    frequency: daily
+    compute: {op: level, smooth: {op: rolling_mean, months: 1}, post: {op: diff, horizon: 12M}}
+    sell: {rule: lt, pct: 10, window: {rolling_years: 5}}
+    buy: null
+    series:
+      - role: basket
+        field: SHORT_INT
+        candidates: ["SPY US Equity", "QQQ US Equity", "IWM US Equity",
+                     "LQD US Equity", "HYG US Equity", "TLT US Equity",
+                     "AGG US Equity", "BND US Equity"]
+    notes: "Effective start 2007-04-13, set by HYG."
+
+  - id: risk_parity_equity_allocation
+    name: "Risk parity equity allocation"
+    hsbc_ref: 7
+    frequency: daily
+    compute: {op: inverse_vol_allocation, vol_window_days: 60, post: {op: diff, horizon: 3M}}
+    sell: {rule: gt, pct: 90, window: expanding}
+    buy:  {rule: lt, pct: 10, window: expanding}
+    series:
+      - role: sleeve_equity
+        candidates: ["SPX Index"]
+      - role: sleeve_rates
+        candidates: ["LUATTRUU Index", "IEF US Equity"]
+      - role: sleeve_credit
+        candidates: ["LF98TRUU Index", "HYG US Equity"]
+      - role: sleeve_commodity
+        candidates: ["BCOMTR Index", "BCOM Index"]
+
+  - id: vol_target_equity_allocation
+    name: "Vol-target equity allocation"
+    hsbc_ref: 8
+    frequency: daily
+    compute: {op: vol_target_allocation, target_vol: 0.10, vol_window_days: 60,
+              post: {op: diff, horizon: 6M}}
+    sell: {rule: gt, pct: 90, window: expanding}
+    buy:  {rule: lt, pct: 20, window: expanding}
+    series:
+      - role: underlying
+        candidates: ["SPX Index"]
+
+  - id: equity_momentum_indicator
+    name: "Equity momentum and open interest"
+    ui_label: "Equity momentum proxy (substitute for HSBC positioning model)"
+    hsbc_ref: 9
+    frequency: daily
+    is_substitute: true
+    compute: {op: zscore_composite, window_days: 252}
+    sell: {rule: gt, pct: 80, window: {rolling_years: 5}}
+    buy:  {rule: lt, pct: 10, window: {rolling_years: 5}}
+    series:
+      - role: futures_price
+        candidates: ["ES1 Index"]
+      - role: open_interest
+        field: OPEN_INT
+        candidates: ["ES1 Index"]
+    notes: "HSBC's model is undisclosed. This is a substitute, not a replication."
+
+  - id: capca
+    name: "CAPCA (put-call), equity only"
+    hsbc_ref: 10
+    frequency: daily
+    compute: {op: mean_of_zscores, post: {op: diff, horizon: 3M}}
+    sell: {rule: gt, pct: 90, window: {rolling_years: 5}}
+    buy:  {rule: lt, pct: 10, window: {rolling_years: 5}}
+    series:
+      - role: equity_put_call
+        candidates: ["PCRTEQTY Index", "PCUSEQTR Index", "PCRTTOTL Index"]
+    notes: >
+      Running equity-only. The UST leg has no usable source: put/call fields on
+      TY1 and TYA return no history.
+
+  - id: mask
+    name: "MASK (multi-asset skew)"
+    hsbc_ref: 11
+    frequency: daily
+    compute: {op: mean_of_zscores, smooth: {op: rolling_mean, months: 1},
+              post: {op: diff, horizon: 3M}}
+    sell: {rule: lt, pct: 10, window: expanding}
+    buy:  {rule: gt, pct: 90, window: expanding}
+    series:
+      - role: equity_skew
+        candidates: ["SKEW Index"]
+      - role: ust_skew
+        field: 3MO_CALL_IMP_VOL
+        candidates: ["TLT US Equity", "IEF US Equity"]
+
+  - id: vix_curve
+    name: "VIX curve (VIX3M / VIX)"
+    hsbc_ref: 12
+    frequency: daily
+    compute: {op: ratio, smooth: {op: rolling_mean, months: 3}, post: {op: diff, horizon: 1M}}
+    sell: {rule: gt, pct: 90, window: {rolling_years: 5}}
+    buy:  {rule: lt, pct: 10, window: {rolling_years: 5}}
+    series:
+      - role: numerator
+        candidates: ["VIX3M Index", "VXV Index"]
+      - role: denominator
+        candidates: ["VIX Index"]
+
+  - id: vix_hy_vix_ig
+    name: "HY / IG implied vol ratio"
+    hsbc_ref: 13
+    frequency: daily
+    compute: {op: ratio}
+    sell: null
+    buy:  {rule: gt, pct: 90, window: expanding}
+    series:
+      - role: numerator
+        field: 3MO_CALL_IMP_VOL
+        candidates: ["HYG US Equity"]
+      - role: denominator
+        field: 3MO_CALL_IMP_VOL
+        candidates: ["LQD US Equity"]
+    notes: "Effective start 2007-04-11. Cboe VXHYG and VXIGX are discontinued."
+
+  - id: move
+    name: "MOVE index"
+    hsbc_ref: 14
+    frequency: daily
+    compute: {op: level, smooth: {op: rolling_mean, months: 1}, post: {op: diff, horizon: 3M}}
+    sell: {rule: lt, pct: 10, window: expanding}
+    buy: null
+    series:
+      - role: primary
+        candidates: ["MOVE Index"]
+
+  - id: risk_appetite_pc1
+    name: "Risk appetite, first principal component"
+    hsbc_ref: 15
+    frequency: daily
+    compute: {op: pca_first_component, window_days: 252, post: {op: diff, horizon: 6M}}
+    sell: {rule: gt, pct: 90, window: {rolling_years: 3}}
+    buy: null
+    series:
+      - role: basket
+        candidates: ["SPX Index", "LUATTRUU Index", "LF98TRUU Index",
+                     "BCOMTR Index", "XAU Curncy", "AUDJPY Curncy", "VIX Index"]
+    notes: "HSBC do not disclose constituents; this basket is an interpretation."
+
+  - id: cross_asset_rsi
+    name: "Cross-asset RSI"
+    hsbc_ref: 16
+    frequency: daily
+    compute: {op: mean_rsi, rsi_window_days: 14, smooth: {op: rolling_mean, months: 1},
+              post: {op: diff, horizon: 12M}}
+    sell: {rule: gt, pct: 90, window: {rolling_years: 1}}
+    buy: null
+    series:
+      - role: basket
+        candidates: ["SPX Index", "LUATTRUU Index", "LF98TRUU Index",
+                     "BCOMTR Index", "DXY Curncy"]
+
+  - id: cftc_risk_on_off
+    name: "CFTC risk-on/risk-off positioning"
+    hsbc_ref: 17
+    frequency: weekly
+    compute: {op: mean_of_zscores, post: {op: diff, horizon: 3M}}
+    sell: {rule: gt, pct: 90, window: expanding}
+    buy: null
+    macrobond:
+      release_lag_days: 3
+      normalise_by_open_interest: true
+      # Combined (options and futures) basis throughout; all legs start
+      # 1995-03-21 when CFTC options reporting began. risk_sign inverts the
+      # risk-off legs, without which long gold and long equities cancel.
+      basket:
+        - {key: sp500,  risk_sign: 1,  long: "cftc_cme13874a_8o", short: "cftc_cme13874a_9o", oi: "cftc_cme13874a_7o"}
+        - {key: gold,   risk_sign: -1, long: "cftc_cmx088691_8o", short: "cftc_cmx088691_9o", oi: "cftc_cmx088691_7o"}
+        - {key: ust10y, risk_sign: -1, long: "cftc_cbt043602_8o", short: "cftc_cbt043602_9o", oi: "cftc_cbt043602_7o"}
+        - {key: jpy,    risk_sign: -1, long: "cftc_cme097741_8o", short: "cftc_cme097741_9o", oi: "cftc_cme097741_7o"}
+        - {key: aud,    risk_sign: 1,  long: "cftc_cme232741_8o", short: "cftc_cme232741_9o", oi: "cftc_cme232741_7o"}
+    notes: "Basket constituents and signs are our assumption; HSBC do not disclose theirs."
+
+  - id: cftc_equities
+    name: "CFTC equity net positioning"
+    hsbc_ref: 18
+    frequency: weekly
+    compute: {op: level}
+    sell: {rule: gt, pct: 90, window: expanding}
+    buy:  {rule: lt, pct: 10, window: expanding}
+    macrobond:
+      long: "cftc_cme13874a_8o"
+      short: "cftc_cme13874a_9o"
+      open_interest: "cftc_cme13874a_7o"
+      release_lag_days: 3
+      normalise_by_open_interest: true
+      # Net computed from weekly components rather than the _8onet series,
+      # which Macrobond forward-fills to daily.
+    notes: >
+      Scaled by open interest. E-mini open interest went from 8,938 contracts in
+      1997 to 3,170,383, so raw net counts are not comparable across the sample.
+
+  - id: hsbc_equity_sentiment_proxy
+    name: "Equity sentiment composite"
+    hsbc_ref: 19
+    frequency: daily
+    compute: {op: mean_of_zscores}
+    sell: {rule: gt, pct: 90, window: {rolling_years: 3}}
+    buy:  {rule: lt, pct: 10, window: {rolling_years: 3}}
+    series:
+      - role: survey
+        candidates: ["AAIIBULL Index"]
+      - role: volatility
+        candidates: ["VIX Index"]
+      - role: put_call
+        candidates: ["PCRTEQTY Index", "PCUSEQTR Index"]
+    notes: "Flows leg omitted. Equal weights assumed; HSBC do not publish theirs."
+
+  - id: average_survey_sentiment
+    name: "Average survey sentiment"
+    hsbc_ref: 20
+    frequency: weekly
+    compute: {op: mean_of_zscores, post: {op: diff, horizon: 12M}}
+    sell: {rule: gt, pct: 90, window: expanding}
+    buy:  {rule: lt, pct: 10, window: expanding}
+    series:
+      - role: aaii_bull
+        candidates: ["AAIIBULL Index"]
+      - role: aaii_bear
+        candidates: ["AAIIBEAR Index"]
+      - role: naaim
+        candidates: ["NAAIMEXP Index"]
+    notes: >
+      Investors Intelligence unavailable (paid Chartcraft feed, no Bloomberg
+      ticker). Effective start 2006-07-05, set by NAAIM.
+
+  - id: money_market_3m_flow
+    name: "Money market fund assets, 3-month change"
+    hsbc_ref: 21
+    frequency: weekly
+    compute: {op: level, smooth: {op: rolling_mean, months: 1}, post: {op: diff, horizon: 3M}}
+    sell: {rule: lt, pct: 10, window: {rolling_years: 5}}
+    buy:  {rule: gt, pct: 90, window: {rolling_years: 5}}
+    macrobond:
+      series: "usfund0066"
+      release_lag_days: 2
+    notes: >
+      Total universe, confirmed by additivity: retail (usfund0067, 3,099,084mn)
+      plus institutional (usfund0068, 4,810,236mn) equals 7,909,320mn.
+
+# Correlation clusters. Inputs within a cluster share the cluster's weight in
+# the improved aggregation, which stops a theme with many representatives from
+# dominating the reading.
+clusters:
+  beta_exposure:         [cta_equity_beta, us_equity_fund_beta, us_multi_asset_fund_equity_beta]
+  volatility:            [vix_curve, vix_hy_vix_ig, move, mask]
+  options_flow:          [capca]
+  positioning:           [cftc_equities, cftc_risk_on_off, equity_momentum_indicator,
+                          short_interest_equity_etfs, short_interest_equity_bond_etfs]
+  surveys:               [average_survey_sentiment, hsbc_equity_sentiment_proxy]
+  systematic_allocation: [risk_parity_equity_allocation, vol_target_equity_allocation]
+  price_momentum:        [cross_asset_rsi, risk_appetite_pc1]
+  flows:                 [money_market_3m_flow]
+  fx_beta:               [cta_usd_beta]

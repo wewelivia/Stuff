@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentiment Indicator</title>
+<style>
+:root{
+  --bg:#f6f7f9; --panel:#fff; --ink:#12181f; --muted:#5d6b7a; --line:#dfe4ea;
+  --accent:#00aeef; --sell:#c8102e; --buy:#00847d; --warn:#b26a00;
+  --band0:#8a98a6; --band1:#4a9fd8; --band2:#f0a202; --band3:#e4572e; --band4:#a3123a;
+}
+html[data-theme=dark]{
+  --bg:#12171d; --panel:#1a2128; --ink:#e8edf2; --muted:#93a1b0; --line:#2a343e;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+     font:14px/1.5 "Segoe UI",-apple-system,Helvetica,Arial,sans-serif}
+header{display:flex;align-items:center;gap:16px;padding:14px 22px;
+       background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+h1{font-size:17px;margin:0;font-weight:600;letter-spacing:.2px}
+.spacer{flex:1}
+button,select{background:var(--panel);color:var(--ink);border:1px solid var(--line);
+  border-radius:6px;padding:6px 11px;font-size:13px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+main{padding:20px 22px;max-width:1360px;margin:0 auto}
+.grid{display:grid;gap:16px}
+.g2{grid-template-columns:repeat(auto-fit,minmax(400px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:16px}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.9px;
+         color:var(--muted);margin:0 0 12px;font-weight:600}
+.readout{display:flex;align-items:baseline;gap:12px;margin-bottom:6px}
+.big{font-size:40px;font-weight:600;line-height:1}
+.band{padding:3px 11px;border-radius:20px;color:#fff;font-size:12px;font-weight:600}
+.b0{background:var(--band0)}.b1{background:var(--band1)}.b2{background:var(--band2)}
+.b3{background:var(--band3)}.b4{background:var(--band4)}
+.sub{color:var(--muted);font-size:12px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+.pos{color:var(--buy)}.neg{color:var(--sell)}
+.chip{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;
+      border:1px solid var(--line);color:var(--muted);margin-left:6px}
+.chip.sub{border-color:var(--warn);color:var(--warn)}
+.chip.thin{border-color:var(--sell);color:var(--sell)}
+.bar{height:7px;background:var(--line);border-radius:4px;overflow:hidden;min-width:70px}
+.bar>span{display:block;height:100%;background:var(--accent)}
+.notice{padding:10px 13px;border-left:3px solid var(--warn);background:rgba(178,106,0,.08);
+        border-radius:0 6px 6px 0;font-size:12.5px;margin-bottom:14px;color:var(--muted)}
+.err{border-left-color:var(--sell);background:rgba(200,16,46,.08)}
+svg{width:100%;height:230px;display:block}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);margin-top:8px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px}
+.muted{color:var(--muted)}
+dialog{border:1px solid var(--line);border-radius:9px;background:var(--panel);color:var(--ink);
+       padding:18px;max-width:420px}
+dialog input{width:100%;padding:7px;border:1px solid var(--line);border-radius:6px;
+             background:var(--bg);color:var(--ink);margin:8px 0 14px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Sentiment Indicator</h1>
+  <select id="side"><option value="sell">Sell signals</option><option value="buy">Buy signals</option></select>
+  <select id="mode"><option value="replica">Replica (binary count)</option>
+                    <option value="improved">Improved (cluster hinge)</option></select>
+  <span class="spacer"></span>
+  <span id="stamp" class="sub"></span>
+  <button id="refresh">Refresh</button>
+  <button id="theme">Theme</button>
+  <button id="cfg">&#9881;</button>
+</header>
+
+<main>
+  <div id="alerts"></div>
+
+  <div class="grid g2">
+    <div class="card">
+      <h2>Current reading</h2>
+      <div class="readout">
+        <span class="big" id="reading">&mdash;</span>
+        <span class="band b0" id="bandLabel">&mdash;</span>
+      </div>
+      <div class="sub" id="readingSub"></div>
+      <div class="legend" id="bandLegend"></div>
+    </div>
+
+    <div class="card">
+      <h2>Lift over base rate</h2>
+      <div id="liftBox" class="sub">&mdash;</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>History <span class="muted" style="text-transform:none;letter-spacing:0">
+      (dashed lines are walk-forward thresholds)</span></h2>
+    <svg id="chart" viewBox="0 0 1000 230" preserveAspectRatio="none"></svg>
+    <div class="legend">
+      <span><i style="background:var(--accent)"></i>Reading</span>
+      <span><i style="background:var(--band3)"></i>Strong</span>
+      <span><i style="background:var(--band4)"></i>Extreme</span>
+    </div>
+  </div>
+
+  <div class="grid g2" style="margin-top:16px">
+    <div class="card">
+      <h2>Inputs</h2>
+      <table><thead><tr><th>Input</th><th class="num">Percentile</th>
+        <th class="num">Strength</th><th class="num">Fired</th></tr></thead>
+        <tbody id="inputRows"></tbody></table>
+    </div>
+
+    <div class="card">
+      <h2>Performance by band</h2>
+      <table><thead><tr><th>Band</th><th class="num">Time</th><th class="num">Base</th>
+        <th class="num">Actual</th><th class="num">Lift</th><th class="num">n eff</th></tr></thead>
+        <tbody id="bandRows"></tbody></table>
+      <div class="sub" id="bandNote" style="margin-top:9px"></div>
+    </div>
+  </div>
+</main>
+
+<dialog id="cfgDlg">
+  <b>API endpoint</b>
+  <input id="cfgUrl" placeholder="http://10.0.0.5:8010">
+  <div style="display:flex;gap:8px;justify-content:flex-end">
+    <button id="cfgCancel">Cancel</button><button id="cfgSave">Save</button>
+  </div>
+</dialog>
+
+<script>
+const KEY_API='sentiment-api-base', KEY_THEME='sentiment-theme';
+const $=id=>document.getElementById(id);
+let payload=null;
+
+function apiBase(){return localStorage.getItem(KEY_API)||window.location.origin;}
+function pct(v,d){return v==null||isNaN(v)?'—':(v*100).toFixed(d===undefined?1:d)+'%';}
+function signed(v,d){if(v==null||isNaN(v))return '—';
+  return (v>=0?'+':'')+(v*100).toFixed(d===undefined?1:d)+'%';}
+function bandClass(name){
+  return {'No signal':'b0',Mild:'b1',Moderate:'b2',Strong:'b3',Extreme:'b4'}[name]||'b0';}
+
+function alertBox(msg,isErr){
+  const d=document.createElement('div');
+  d.className='notice'+(isErr?' err':'');d.textContent=msg;$('alerts').appendChild(d);}
+
+async function load(refresh){
+  $('alerts').innerHTML='';
+  try{
+    const r=await fetch(apiBase()+'/api/sentiment/'+(refresh?'?refresh=true':''));
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    payload=await r.json();
+    render();
+    await drawChart();
+  }catch(e){
+    alertBox('Could not reach the API at '+apiBase()+'. '+e.message+
+             '  Use the gear icon to set the endpoint.',true);
+  }
+}
+
+function render(){
+  if(!payload) return;
+  $('stamp').textContent='Updated '+(payload.generated||'').replace('T',' ');
+
+  const b=payload.build||{};
+  if(b.skipped && Object.keys(b.skipped).length)
+    alertBox('Inputs unavailable: '+Object.keys(b.skipped).join(', ')+
+             '. The denominator below is reduced accordingly.');
+  if(b.substitutes && b.substitutes.length)
+    alertBox('Substitute inputs in use: '+b.substitutes.join(', ')+
+             '. These approximate the published construction rather than reproduce it.');
+
+  const key=$('side').value+'_'+$('mode').value;
+  const side=(payload.sides||{})[key];
+  if(!side){alertBox('No data for '+key,true);return;}
+
+  const L=side.latest;
+  $('reading').textContent=pct(L.reading,0);
+  const bl=$('bandLabel');
+  bl.textContent=L.band_calibrated||'—';
+  bl.className='band '+bandClass(L.band_calibrated);
+
+  let sub=L.date+' · '+L.fired_count+' of '+L.denominator+' inputs firing';
+  if(L.published_denominator && L.denominator!==L.published_denominator)
+    sub+=' (published denominator '+L.published_denominator+')';
+  if(L.dropped_inputs && L.dropped_inputs.length)
+    sub+=' · unavailable: '+L.dropped_inputs.join(', ');
+  $('readingSub').textContent=sub;
+
+  const cal=side.bands.calibrated||{}, pub=side.bands.published||{};
+  $('bandLegend').innerHTML=Object.keys(cal).map(n=>
+    '<span><i class="'+bandClass(n)+'" style="background:var(--'+
+    ({Mild:'band1',Moderate:'band2',Strong:'band3',Extreme:'band4'}[n])+')"></i>'+
+    n+' '+pct(cal[n],0)+' <span class="muted">(published '+pct(pub[n],0)+')</span></span>').join('');
+
+  renderLift(side);
+  renderInputs(L.inputs||[]);
+  renderBands(side);
+}
+
+function renderLift(side){
+  const ev=side.evaluation;
+  if(!ev){$('liftBox').textContent='No benchmark series available.';return;}
+  const rows=Object.keys(ev.by_horizon||{}).sort((a,b)=>a-b).map(h=>{
+    const r=ev.by_horizon[h];
+    const ci=(r.lift_ci&&r.lift_ci[0]!=null)?
+      ' <span class="muted">['+signed(r.lift_ci[0])+', '+signed(r.lift_ci[1])+']</span>':'';
+    const sig=Math.abs(r.t_stat)>=2?'':' <span class="chip thin">not significant</span>';
+    return '<tr><td>'+h+'d</td><td class="num">'+pct(r.base_rate)+'</td>'+
+      '<td class="num">'+pct(r.conditional_rate)+'</td>'+
+      '<td class="num '+(r.lift>0?'pos':'neg')+'">'+signed(r.lift)+ci+'</td>'+
+      '<td class="num">'+(r.t_stat==null?'—':r.t_stat.toFixed(2))+sig+'</td>'+
+      '<td class="num">'+Math.round(r.n_effective||0)+'</td></tr>';}).join('');
+  $('liftBox').innerHTML=
+    '<table><thead><tr><th>Horizon</th><th class="num">Base rate</th>'+
+    '<th class="num">Conditional</th><th class="num">Lift</th>'+
+    '<th class="num">t (HAC)</th><th class="num">n eff</th></tr></thead><tbody>'+rows+
+    '</tbody></table><div class="sub" style="margin-top:9px">'+
+    'Lift is conditional minus base rate. t-statistics use Newey-West with the lag '+
+    'matched to the return overlap; n eff is the independent-equivalent sample. '+
+    (ev.redundancy?('Redundancy: '+Math.round(ev.redundancy.effective_k)+' effective inputs of '+
+      Math.round(ev.redundancy.nominal_k)+'.'):'')+'</div>';
+}
+
+function renderInputs(rows){
+  $('inputRows').innerHTML=rows.map(r=>{
+    if(!r.available)
+      return '<tr><td>'+r.id+' <span class="chip">unavailable</span></td>'+
+             '<td class="num">—</td><td class="num">—</td><td class="num">—</td></tr>';
+    const meta=(payload._inputs||{})[r.id]||{};
+    const sub=meta.is_substitute?' <span class="chip sub">substitute</span>':'';
+    return '<tr><td>'+(meta.label||r.id)+sub+'</td>'+
+      '<td class="num">'+pct(r.percentile,0)+'</td>'+
+      '<td class="num"><div class="bar"><span style="width:'+
+        Math.round((r.hinge||0)*100)+'%"></span></div></td>'+
+      '<td class="num">'+(r.fired?'yes':'—')+'</td></tr>';}).join('');
+}
+
+function renderBands(side){
+  const t=(side.evaluation&&side.evaluation.band_table)||[];
+  if(!t.length){$('bandRows').innerHTML='<tr><td colspan="6" class="muted">No data</td></tr>';return;}
+  $('bandRows').innerHTML=t.map(r=>
+    '<tr><td><span class="band '+bandClass(r.band)+'">'+r.band+'</span>'+
+    (r.thin?' <span class="chip thin">thin</span>':'')+'</td>'+
+    '<td class="num">'+pct(r.share_of_time,0)+'</td>'+
+    '<td class="num">'+pct(r.base_rate)+'</td>'+
+    '<td class="num">'+pct(r.conditional_rate)+'</td>'+
+    '<td class="num '+(r.lift>0?'pos':'neg')+'">'+signed(r.lift)+'</td>'+
+    '<td class="num">'+Math.round(r.n_effective||0)+'</td></tr>').join('');
+  $('bandNote').textContent='Horizon '+((side.evaluation||{}).headline_horizon||63)+
+    ' trading days. Bands marked thin rest on fewer than ten independent observations.';
+}
+
+async function drawChart(){
+  const svg=$('chart'); svg.innerHTML='';
+  try{
+    const key=$('side').value+'_'+$('mode').value;
+    const r=await fetch(apiBase()+'/api/sentiment/history?side='+$('side').value+
+                        '&mode='+$('mode').value);
+    if(!r.ok) return;
+    const h=await r.json();
+    const v=h.values, n=v.length;
+    if(!n) return;
+    const W=1000,H=230,P=6;
+    const max=Math.max(0.5,Math.max.apply(null,v.filter(x=>x!=null)));
+    const X=i=>P+i*(W-2*P)/Math.max(n-1,1);
+    const Y=y=>H-P-(y/max)*(H-2*P);
+
+    const wf=h.walk_forward_bands||{};
+    [['Strong','var(--band3)'],['Extreme','var(--band4)']].forEach(([name,col])=>{
+      const s=wf[name]; if(!s) return;
+      let d='',started=false;
+      s.forEach((y,i)=>{if(y==null){started=false;return;}
+        d+=(started?'L':'M')+X(i).toFixed(1)+' '+Y(y).toFixed(1)+' ';started=true;});
+      if(d) svg.insertAdjacentHTML('beforeend','<path d="'+d+
+        '" fill="none" stroke="'+col+'" stroke-width="1.2" stroke-dasharray="4 3" opacity=".85"/>');
+    });
+
+    let d='';
+    v.forEach((y,i)=>{d+=(i?'L':'M')+X(i).toFixed(1)+' '+Y(y).toFixed(1)+' ';});
+    svg.insertAdjacentHTML('beforeend','<path d="'+d+
+      '" fill="none" stroke="var(--accent)" stroke-width="1.4"/>');
+  }catch(e){}
+}
+
+$('side').onchange=()=>{render();drawChart();};
+$('mode').onchange=()=>{render();drawChart();};
+$('refresh').onclick=()=>load(true);
+$('theme').onclick=()=>{
+  const cur=document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark';
+  document.documentElement.setAttribute('data-theme',cur);
+  localStorage.setItem(KEY_THEME,cur);};
+$('cfg').onclick=()=>{$('cfgUrl').value=localStorage.getItem(KEY_API)||'';$('cfgDlg').showModal();};
+$('cfgCancel').onclick=()=>$('cfgDlg').close();
+$('cfgSave').onclick=()=>{
+  const v=$('cfgUrl').value.trim();
+  if(v) localStorage.setItem(KEY_API,v.replace(/\/$/,'')); else localStorage.removeItem(KEY_API);
+  $('cfgDlg').close();load(false);};
+
+document.documentElement.setAttribute('data-theme',localStorage.getItem(KEY_THEME)||'light');
+load(false);
+</script>
+</body>
+</html>

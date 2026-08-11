@@ -1,0 +1,10 @@
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14.0
+PyYAML>=6.0
+fastapi>=0.110
+uvicorn>=0.27
+
+# Vendor access, installed per machine:
+#   blpapi    Bloomberg Desktop API (from Bloomberg, not PyPI)
+#   pywin32   required for the Macrobond COM connection on Windows
