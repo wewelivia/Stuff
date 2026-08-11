@@ -41,7 +41,11 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(fh)
 
 
-OBS_PER_YEAR = {"daily": 252, "weekly": 52, "monthly": 12}
+OBS_PER_YEAR = {"daily": 252, "weekly": 52, "semimonthly": 24, "monthly": 12}
+
+# Observations required before a percentile is meaningful, per frequency.
+# Roughly two years in each case.
+MIN_PERIODS = {"daily": 252, "weekly": 104, "semimonthly": 48, "monthly": 24}
 
 # Business days a percentile rank may be carried forward before the input
 # leaves the denominator. Weekly data must survive four intervening days,
@@ -49,7 +53,7 @@ OBS_PER_YEAR = {"daily": 252, "weekly": 52, "monthly": 12}
 # as though inputs have stopped firing. Daily inputs get a short bridge for
 # holidays and vendors that publish a day late. Limits sit inside the staleness
 # cutoffs in providers.base, so a genuinely dead series still drops out.
-FILL_LIMIT_BDAYS = {"daily": 3, "weekly": 10, "monthly": 45}
+FILL_LIMIT_BDAYS = {"daily": 3, "weekly": 10, "semimonthly": 20, "monthly": 45}
 
 
 def _rule(spec: Optional[dict], freq: str = "daily") -> Optional[eng.TriggerRule]:
@@ -108,7 +112,20 @@ class SentimentBuilder:
                 continue
 
             freq = entry.get("frequency", "daily")
-            min_periods = 104 if freq == "weekly" else 252
+            min_periods = MIN_PERIODS.get(freq, 252)
+
+            # A rolling window longer than the series can ever hold produces no
+            # percentile at all, which shows up as a permanently missing input.
+            for rule in (entry.get("sell"), entry.get("buy")):
+                converted = _rule(rule, freq)
+                if converted is None or converted.window == "expanding":
+                    continue
+                available = len(series.dropna())
+                if converted.window > available:
+                    log.warning(
+                        "%s: %s-observation window exceeds the %d observations available "
+                        "at %s frequency; input will never fire",
+                        iid, converted.window, available, freq)
 
             inputs.append(eng.SentimentInput(
                 id=iid, series=series, cluster=self.clusters.get(iid, iid),
