@@ -20,10 +20,42 @@ import numpy as np
 import pandas as pd
 
 
-# --- forward returns -------------------------------------------------------
+# --- forward outcomes ------------------------------------------------------
 def forward_returns(prices: pd.Series, horizon: int) -> pd.Series:
     """Return from t to t+horizon, stamped at t."""
     return prices.shift(-horizon) / prices - 1.0
+
+
+def forward_max_drawdown(prices: pd.Series, horizon: int) -> pd.Series:
+    """Worst peak-to-trough fall between t and t+horizon, as a positive number.
+
+    Positioning and sentiment have a better documented relationship with
+    fragility than with direction, so this is usually a more promising target
+    than the sign of the return.
+    """
+    values = prices.to_numpy(dtype=float)
+    n = len(values)
+    out = np.full(n, np.nan)
+    for i in range(n - horizon):
+        window = values[i:i + horizon + 1]
+        peak = np.maximum.accumulate(window)
+        out[i] = float(np.max(1.0 - window / peak))
+    return pd.Series(out, index=prices.index)
+
+
+def forward_realised_vol(prices: pd.Series, horizon: int,
+                         annualise: int = 252) -> pd.Series:
+    """Annualised realised volatility between t and t+horizon."""
+    rets = np.log(prices / prices.shift(1))
+    fwd = rets.rolling(horizon).std().shift(-horizon) * np.sqrt(annualise)
+    return fwd
+
+
+TARGETS = {
+    "return": forward_returns,
+    "drawdown": forward_max_drawdown,
+    "volatility": forward_realised_vol,
+}
 
 
 def effective_sample_size(n: int, horizon: int) -> float:
@@ -302,6 +334,166 @@ def redundancy_ratio(reading: pd.Series, k: int, fire_prob: float,
             best_gap, best_k = gap, k_try
     return {"observed_quantile": observed, "nominal_k": float(k),
             "effective_k": float(best_k), "ratio": best_k / float(k)}
+
+
+# --- alternatives to the threshold test ------------------------------------
+def regress_on_reading(prices: pd.Series, reading: pd.Series, horizon: int,
+                       target: str = "return", lags: Optional[int] = None,
+                       standardise: bool = True) -> Dict[str, float]:
+    """Regress a forward outcome on the continuous reading, using every
+    observation rather than only the few percent above a threshold.
+
+    A threshold test on a signal that fires 5% of the time discards 95% of the
+    sample. This keeps all of it, so it has far more power to detect a monotone
+    relationship if one exists. Newey-West applies as before.
+
+    With `standardise`, the slope reads as the change in outcome per one
+    standard deviation of the reading.
+    """
+    fn = TARGETS.get(target)
+    if fn is None:
+        raise ValueError(f"unknown target {target!r}; choose from {sorted(TARGETS)}")
+
+    y = fn(prices, horizon)
+    df = pd.concat([y.rename("y"), reading.rename("x")], axis=1).dropna()
+    if len(df) < 60:
+        return {"slope": np.nan, "t_stat": np.nan, "n": float(len(df))}
+
+    x = df["x"].to_numpy(dtype=float)
+    if standardise:
+        sd = x.std()
+        x = (x - x.mean()) / (sd if sd > 0 else 1.0)
+    X = np.column_stack([np.ones(len(x)), x])
+
+    L = int(lags) if lags is not None else max(int(horizon) - 1, 1)
+    beta, se = newey_west_ols(df["y"].to_numpy(dtype=float), X, L)
+
+    slope, se_slope = float(beta[1]), float(se[1])
+    resid = df["y"].to_numpy(dtype=float) - X @ beta
+    ss_tot = float(((df["y"] - df["y"].mean()) ** 2).sum())
+    return {
+        "target": target, "horizon": horizon,
+        "slope": slope, "se": se_slope,
+        "t_stat": slope / se_slope if se_slope > 0 else np.nan,
+        "r_squared": 1.0 - float((resid ** 2).sum()) / ss_tot if ss_tot > 0 else np.nan,
+        "n": float(len(df)),
+        "n_effective": effective_sample_size(len(df), horizon),
+        "outcome_mean": float(df["y"].mean()),
+        "outcome_sd": float(df["y"].std()),
+    }
+
+
+def compare_targets(prices: pd.Series, reading: pd.Series,
+                    horizons: Sequence[int] = (21, 63, 126)) -> pd.DataFrame:
+    """Run the continuous regression against all three targets and horizons.
+
+    Intended as the first test of whether the inputs inform fragility even
+    where they say nothing about direction.
+    """
+    rows = []
+    for target in TARGETS:
+        for h in horizons:
+            try:
+                rows.append(regress_on_reading(prices, reading, h, target))
+            except Exception:
+                continue
+    return pd.DataFrame(rows)
+
+
+# --- is the reading telling us anything price and vol do not? --------------
+def trailing_state(prices: pd.Series,
+                   return_lookbacks: Sequence[int] = (21, 63, 252),
+                   vol_lookbacks: Sequence[int] = (21, 63)) -> pd.DataFrame:
+    """Trailing return and volatility features, all known at t.
+
+    This is the "already obvious" state of the market. Any sentiment reading
+    should be judged on what it adds to this, not on what it predicts alongside
+    it.
+    """
+    out = pd.DataFrame(index=prices.index)
+    for lb in return_lookbacks:
+        out[f"ret_{lb}"] = prices / prices.shift(lb) - 1.0
+    logret = np.log(prices / prices.shift(1))
+    for lb in vol_lookbacks:
+        out[f"vol_{lb}"] = logret.rolling(lb).std() * np.sqrt(252)
+    return out
+
+
+def explained_by_state(reading: pd.Series, prices: pd.Series) -> Dict[str, float]:
+    """How much of the reading is a restatement of trailing price and vol.
+
+    A high R-squared means the indicator is largely re-describing what the
+    market has just done, which you already know without it.
+    """
+    X = trailing_state(prices)
+    df = pd.concat([reading.rename("y"), X], axis=1).dropna()
+    if len(df) < 100:
+        return {"r_squared": np.nan, "n": float(len(df))}
+
+    y = df["y"].to_numpy(dtype=float)
+    Xm = np.column_stack([np.ones(len(df))] + [df[c].to_numpy(dtype=float)
+                                               for c in X.columns])
+    beta, _ = newey_west_ols(y, Xm, 1)
+    resid = y - Xm @ beta
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    return {
+        "r_squared": 1.0 - float((resid ** 2).sum()) / ss_tot if ss_tot > 0 else np.nan,
+        "n": float(len(df)),
+        "residual": pd.Series(resid, index=df.index),
+    }
+
+
+def incremental_test(prices: pd.Series, reading: pd.Series, horizon: int,
+                     target: str = "return", lags: Optional[int] = None) -> Dict[str, float]:
+    """Does the reading add anything to a model built from price and vol alone?
+
+    Fits the forward outcome on trailing state, then on trailing state plus the
+    reading, and reports the change in fit and the Newey-West t-statistic on the
+    reading's coefficient. This is the question that matters: not whether the
+    indicator predicts, but whether it predicts anything you did not already
+    know from the price series.
+    """
+    fn = TARGETS.get(target)
+    if fn is None:
+        raise ValueError(f"unknown target {target!r}")
+
+    y = fn(prices, horizon)
+    X = trailing_state(prices)
+    df = pd.concat([y.rename("y"), reading.rename("sent"), X], axis=1).dropna()
+    if len(df) < 120:
+        return {"target": target, "horizon": horizon, "n": float(len(df)),
+                "t_stat": np.nan}
+
+    yv = df["y"].to_numpy(dtype=float)
+    state = [df[c].to_numpy(dtype=float) for c in X.columns]
+    sent = df["sent"].to_numpy(dtype=float)
+    sd = sent.std()
+    sent = (sent - sent.mean()) / (sd if sd > 0 else 1.0)
+
+    L = int(lags) if lags is not None else max(int(horizon) - 1, 1)
+    ss_tot = float(((yv - yv.mean()) ** 2).sum())
+
+    def _fit(cols):
+        Xm = np.column_stack([np.ones(len(yv))] + cols)
+        b, se = newey_west_ols(yv, Xm, L)
+        r = yv - Xm @ b
+        r2 = 1.0 - float((r ** 2).sum()) / ss_tot if ss_tot > 0 else np.nan
+        return b, se, r2
+
+    _, _, r2_base = _fit(state)
+    beta, se, r2_full = _fit(state + [sent])
+
+    slope, se_slope = float(beta[-1]), float(se[-1])
+    return {
+        "target": target, "horizon": horizon,
+        "r2_state_only": r2_base,
+        "r2_with_reading": r2_full,
+        "delta_r2": r2_full - r2_base,
+        "slope": slope, "se": se_slope,
+        "t_stat": slope / se_slope if se_slope > 0 else np.nan,
+        "n": float(len(df)),
+        "n_effective": effective_sample_size(len(df), horizon),
+    }
 
 
 def full_evaluation(prices: pd.Series, reading: pd.Series, signal: pd.Series,
