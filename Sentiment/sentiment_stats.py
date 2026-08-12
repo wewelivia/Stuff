@@ -496,6 +496,48 @@ def incremental_test(prices: pd.Series, reading: pd.Series, horizon: int,
     }
 
 
+def placebo_incremental(prices: pd.Series, reading: pd.Series, horizon: int,
+                        target: str = "volatility", n_shifts: int = 400,
+                        min_shift: int = 252, seed: int = 0) -> Dict[str, object]:
+    """Null distribution of the incremental t-statistic by circular shifting.
+
+    Shifting the reading in time preserves its autocorrelation exactly while
+    destroying its alignment with the outcome. That is a stricter null than
+    resampling, because the persistence which inflates t-statistics is left
+    intact. If the observed statistic sits inside this distribution, it is what
+    a persistent series unrelated to the outcome would produce.
+    """
+    rng = np.random.default_rng(seed)
+    clean = reading.dropna()
+    n = len(clean)
+    if n < min_shift * 3:
+        return {"observed": np.nan, "n_shifts": 0}
+
+    observed = incremental_test(prices, reading, horizon, target).get("t_stat", np.nan)
+
+    values = clean.to_numpy(dtype=float)
+    stats_null: List[float] = []
+    for _ in range(n_shifts):
+        k = int(rng.integers(min_shift, n - min_shift))
+        shifted = pd.Series(np.roll(values, k), index=clean.index)
+        t = incremental_test(prices, shifted, horizon, target).get("t_stat", np.nan)
+        if t == t:
+            stats_null.append(abs(t))
+
+    if len(stats_null) < 30:
+        return {"observed": observed, "n_shifts": len(stats_null)}
+
+    arr = np.array(stats_null)
+    return {
+        "observed": observed,
+        "n_shifts": len(arr),
+        "null_mean": float(arr.mean()),
+        "null_p95": float(np.quantile(arr, 0.95)),
+        "null_max": float(arr.max()),
+        "p_value": float((arr >= abs(observed)).mean()) if observed == observed else np.nan,
+    }
+
+
 def full_evaluation(prices: pd.Series, reading: pd.Series, signal: pd.Series,
                     side: str, horizons: Sequence[int] = (21, 63, 126),
                     n_boot: int = 300) -> Dict[str, object]:
