@@ -538,6 +538,62 @@ def placebo_incremental(prices: pd.Series, reading: pd.Series, horizon: int,
     }
 
 
+def placebo_max_incremental(prices: pd.Series, reading: pd.Series,
+                            horizons: Sequence[int] = (21, 63, 126),
+                            targets: Sequence[str] = ("return", "drawdown", "volatility"),
+                            n_shifts: int = 300, min_shift: int = 252,
+                            seed: int = 0) -> Dict[str, object]:
+    """Selection-corrected placebo.
+
+    placebo_incremental tests a single cell. If that cell was chosen as the
+    best of several, its p-value is optimistic: the relevant null is the
+    distribution of the LARGEST statistic across everything tried, not of the
+    one that won.
+
+    For each circular shift this recomputes every target and horizon and keeps
+    the maximum, so the observed maximum is compared like with like.
+    """
+    rng = np.random.default_rng(seed)
+    clean = reading.dropna()
+    n = len(clean)
+    if n < min_shift * 3:
+        return {"observed_max": np.nan, "n_shifts": 0}
+
+    def _max_t(series: pd.Series) -> float:
+        best = 0.0
+        for target in targets:
+            for h in horizons:
+                try:
+                    t = incremental_test(prices, series, int(h), target).get("t_stat", np.nan)
+                except Exception:
+                    continue
+                if t == t:
+                    best = max(best, abs(t))
+        return best
+
+    observed = _max_t(reading)
+    values = clean.to_numpy(dtype=float)
+
+    nulls: List[float] = []
+    for _ in range(n_shifts):
+        k = int(rng.integers(min_shift, n - min_shift))
+        nulls.append(_max_t(pd.Series(np.roll(values, k), index=clean.index)))
+
+    arr = np.array([x for x in nulls if x > 0])
+    if len(arr) < 30:
+        return {"observed_max": observed, "n_shifts": len(arr)}
+
+    return {
+        "observed_max": observed,
+        "n_shifts": len(arr),
+        "null_mean": float(arr.mean()),
+        "null_p95": float(np.quantile(arr, 0.95)),
+        "null_max": float(arr.max()),
+        "p_value": float((arr >= observed).mean()),
+        "n_cells": len(targets) * len(horizons),
+    }
+
+
 def full_evaluation(prices: pd.Series, reading: pd.Series, signal: pd.Series,
                     side: str, horizons: Sequence[int] = (21, 63, 126),
                     n_boot: int = 300) -> Dict[str, object]:
