@@ -825,11 +825,16 @@ def fetch_releases(api, regions: Optional[List[str]], verbose: bool = True,
     return list(collected.values())
 
 
-def releases_on_day(releases: Iterable[Any], target: date, tz_offset_hours: float) -> List[Dict[str, Any]]:
-    """Filter release entities to those whose last or next event falls on `target`."""
+def releases_in_range(releases: Iterable[Any], start: date, end: date,
+                      tz_offset_hours: float) -> List[Dict[str, Any]]:
+    """
+    Release entities whose last or next event falls between start and end,
+    inclusive of both days. Local time, so the window boundaries are shifted
+    off UTC by tz_offset_hours before comparing.
+    """
     shift = timedelta(hours=tz_offset_hours)
-    day_start = datetime.combine(target, time.min, tzinfo=timezone.utc) - shift
-    day_end = day_start + timedelta(days=1)
+    win_start = datetime.combine(start, time.min, tzinfo=timezone.utc) - shift
+    win_end = datetime.combine(end, time.min, tzinfo=timezone.utc) - shift + timedelta(days=1)
 
     hits: List[Dict[str, Any]] = []
     for ent in releases:
@@ -841,15 +846,16 @@ def releases_on_day(releases: Iterable[Any], target: date, tz_offset_hours: floa
 
         status = None
         event_time = None
-        if last is not None and day_start <= last < day_end:
+        if last is not None and win_start <= last < win_end:
             status = "Released"
             event_time = last
-        elif nxt is not None and day_start <= nxt < day_end:
+        elif nxt is not None and win_start <= nxt < win_end:
             status = "Upcoming"
             event_time = nxt
         if status is None:
             continue
 
+        local = event_time + shift if event_time else None
         hits.append({
             "release": name,
             "description": _meta(ent, "Description") or _meta(ent, "FullDescription") or name,
@@ -857,10 +863,42 @@ def releases_on_day(releases: Iterable[Any], target: date, tz_offset_hours: floa
             "source": _meta(ent, "Source") or "",
             "status": status,
             "event_time_utc": event_time,
-            "event_time_local": event_time + shift if event_time else None,
+            "event_time_local": local,
+            "release_date": local.strftime("%Y-%m-%d") if local else "",
         })
     hits.sort(key=lambda h: (h["event_time_utc"] or datetime.max.replace(tzinfo=timezone.utc)))
     return hits
+
+
+def releases_on_day(releases: Iterable[Any], target: date,
+                    tz_offset_hours: float) -> List[Dict[str, Any]]:
+    """Single-day convenience wrapper around releases_in_range."""
+    return releases_in_range(releases, target, target, tz_offset_hours)
+
+
+def resolve_dates(args) -> Tuple[date, date]:
+    """
+    Work out the scan window from --date, --from/--to or --days.
+
+    --days 2 means today and yesterday, so a missed day is caught up by the
+    next run without having to work out the dates yourself.
+    """
+    def parse(text: str) -> date:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+
+    if args.date_from or args.date_to:
+        end = parse(args.date_to) if args.date_to else date.today()
+        start = parse(args.date_from) if args.date_from else end
+    elif args.days and args.days > 1:
+        end = parse(args.date) if args.date else date.today()
+        start = end - timedelta(days=args.days - 1)
+    else:
+        end = parse(args.date) if args.date else date.today()
+        start = end
+
+    if start > end:
+        start, end = end, start
+    return start, end
 
 
 def series_for_release(api, release_name: str, regions: Optional[List[str]], limit: int,
@@ -1126,10 +1164,13 @@ def run_probe(api, regions: Optional[List[str]], outdir: str = ".") -> None:
 # --------------------------------------------------------------------------
 
 def run_scan(args) -> Dict[str, Any]:
-    target = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else date.today()
+    start_date, end_date = resolve_dates(args)
     regions, excluded = resolve_regions(args.regions, args.exclude, args.keep_excluded)
 
-    print(f"Macrobond release scan for {target.isoformat()}")
+    span = (end_date - start_date).days + 1
+    label = (start_date.isoformat() if span == 1
+             else f"{start_date.isoformat()} to {end_date.isoformat()} ({span} days)")
+    print(f"Macrobond release scan for {label}")
     print(f"regions: {'all' if regions is None else ','.join(regions)}"
           f"  ({len(regions) if regions else 'unbounded'})")
     if excluded:
@@ -1169,12 +1210,18 @@ def run_scan(args) -> Dict[str, Any]:
             print(f"  from cache, under {args.calendar_ttl_hours}h old")
         print(f"  {len(releases)} {args.kind} releases after filtering")
 
-        todays = releases_on_day(releases, target, args.tz_offset)
+        todays = releases_in_range(releases, start_date, end_date, args.tz_offset)
         todays = todays[:args.max_releases]
         released = [r for r in todays if r["status"] == "Released"]
         upcoming = [r for r in todays if r["status"] != "Released"]
-        print(f"  {len(todays)} releases on {target.isoformat()} "
+        print(f"  {len(todays)} releases in {label} "
               f"({len(released)} released, {len(upcoming)} upcoming)")
+        if span > 1:
+            by_day: Dict[str, int] = {}
+            for r in todays:
+                by_day[r["release_date"]] = by_day.get(r["release_date"], 0) + 1
+            for day in sorted(by_day):
+                print(f"    {day}: {by_day[day]}")
 
         # Only Released entries have a new print. Fetching series for Upcoming
         # ones downloads data we already scored on a previous run.
@@ -1189,12 +1236,14 @@ def run_scan(args) -> Dict[str, Any]:
 
         if not to_score:
             print("  nothing to score. The calendar is still written to the report.")
-            out = {"date": target.isoformat(),
+            out = {"date": end_date.isoformat(),
+                   "date_from": start_date.isoformat(),
+                   "date_to": end_date.isoformat(),
                    "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                    "regions": "all" if regions is None else ",".join(regions),
                    "releases": todays, "rows": []}
             cache.save()
-            write_outputs(out, args.outdir, args.top)
+            write_outputs(out, args, top=args.top)
             return out
 
         print("\n[2/4] resolving member series")
@@ -1240,6 +1289,7 @@ def run_scan(args) -> Dict[str, Any]:
                 "release_description": rel["description"],
                 "region": rel["region"] or (_meta(s, "Region") or ""),
                 "status": rel["status"],
+                "release_date": rel.get("release_date", ""),
                 "event_time_local": rel["event_time_local"].strftime("%Y-%m-%d %H:%M") if rel["event_time_local"] else "",
                 "series": name,
                 "description": _meta(s, "Description") or name,
@@ -1267,13 +1317,15 @@ def run_scan(args) -> Dict[str, Any]:
     print(f"  {len(rows)} series scored")
 
     out = {
-        "date": target.isoformat(),
+        "date": end_date.isoformat(),
+        "date_from": start_date.isoformat(),
+        "date_to": end_date.isoformat(),
         "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "regions": "all" if regions is None else ",".join(regions),
         "releases": todays,
         "rows": rows,
     }
-    write_outputs(out, args.outdir, args.top)
+    write_outputs(out, args, top=args.top)
     return out
 
 
@@ -1282,37 +1334,537 @@ def run_scan(args) -> Dict[str, Any]:
 # --------------------------------------------------------------------------
 
 CSV_FIELDS = [
-    "release", "release_description", "region", "status", "event_time_local",
-    "series", "description", "about", "source", "unit", "frequency", "obs_date",
-    "latest", "previous", "scored_on", "z", "abs_z", "trend_break", "pctile",
-    "n_obs", "window_obs", "window_years", "scale_kind", "verdict",
+    "release_date", "release", "release_description", "region", "status",
+    "event_time_local", "series", "description", "about", "source", "unit",
+    "frequency", "obs_date", "latest", "previous", "scored_on", "z", "abs_z",
+    "trend_break", "pctile", "n_obs", "window_obs", "window_years",
+    "scale_kind", "verdict",
 ]
 
+# Calendar rows go to their own CSV so the viewer can show releases that
+# produced no scored series, which reconstructing from the data alone loses.
+CALENDAR_FIELDS = ["release_date", "event_time_local", "region", "release",
+                   "description", "source", "status"]
 
-def write_outputs(payload: Dict[str, Any], outdir: str, top: int) -> None:
-    os.makedirs(outdir, exist_ok=True)
-    stem = f"macrobond_releases_{payload['date']}"
+VIEWER_FILENAME = "release_viewer.html"
 
-    csv_path = os.path.join(outdir, stem + ".csv")
+
+def output_paths(payload: Dict[str, Any], outdir: str, flat: bool) -> Tuple[str, str]:
+    """
+    (directory, filename stem) for this scan.
+
+    Files are filed under Year/Month of the end date, so a run spanning a month
+    boundary lands in the month it was scanned for rather than being split.
+    """
+    start = payload.get("date_from") or payload["date"]
+    end = payload.get("date_to") or payload["date"]
+    stem = (f"macrobond_releases_{end}" if start == end
+            else f"macrobond_releases_{start}_to_{end}")
+    if flat:
+        return outdir, stem
+    year, month = end[:4], end[5:7]
+    return os.path.join(outdir, year, month), stem
+
+
+def write_outputs(payload: Dict[str, Any], args, top: int = 50) -> None:
+    outdir = args.outdir
+    folder, stem = output_paths(payload, outdir, getattr(args, "flat", False))
+    os.makedirs(folder, exist_ok=True)
+
+    written: List[str] = []
+
+    csv_path = os.path.join(folder, stem + ".csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(payload["rows"])
+    written.append(csv_path)
 
-    json_path = os.path.join(outdir, stem + ".json")
-    with open(json_path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2, default=str)
+    cal_path = os.path.join(folder, stem + "_calendar.csv")
+    with open(cal_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=CALENDAR_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for rel in payload["releases"]:
+            row = dict(rel)
+            local = row.get("event_time_local")
+            row["event_time_local"] = (local.strftime("%Y-%m-%d %H:%M")
+                                       if isinstance(local, datetime) else (local or ""))
+            writer.writerow(row)
+    written.append(cal_path)
 
-    html_path = os.path.join(outdir, stem + ".html")
-    with open(html_path, "w", encoding="utf-8") as fh:
-        fh.write(render_html(payload, top))
+    if not getattr(args, "no_json", False):
+        json_path = os.path.join(folder, stem + ".json")
+        with open(json_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, default=str)
+        written.append(json_path)
 
-    print(f"\nwritten:\n  {csv_path}\n  {json_path}\n  {html_path}")
+    # The viewer is a fixed template that loads a CSV, so it is written once at
+    # the root of the output tree rather than duplicated with every scan.
+    if not getattr(args, "no_viewer", False):
+        os.makedirs(outdir, exist_ok=True)
+        viewer_path = os.path.join(outdir, VIEWER_FILENAME)
+        if getattr(args, "force_viewer", False) or not os.path.exists(viewer_path):
+            with open(viewer_path, "w", encoding="utf-8") as fh:
+                fh.write(render_viewer())
+            written.append(viewer_path + "  (template, reused by every scan)")
+
+    if getattr(args, "self_contained", False):
+        html_path = os.path.join(folder, stem + ".html")
+        with open(html_path, "w", encoding="utf-8") as fh:
+            fh.write(render_html(payload, top))
+        written.append(html_path)
+
+    print("\nwritten:")
+    for path in written:
+        print(f"  {path}")
 
     print(f"\n--- top {min(top, len(payload['rows']))} by |z| ---")
     for r in payload["rows"][:top]:
         print(f"  {r['z']:+6.2f}sd  {r['region']:<3} {r['description'][:60]:<60} "
               f"{r['latest']:>12}  ({r['scored_on']})")
+
+
+def render_viewer() -> str:
+    """
+    The reusable viewer. Written once at the root of the output tree, then
+    reused by every scan: open it, drop a scan CSV on it, and it renders.
+
+    It cannot fetch the CSV itself. Browsers block file:// XHR under the
+    same-origin policy, so the file has to arrive through a picker or a drop,
+    both of which are permitted. Everything else is the same UI as before.
+    """
+    return r"""<!doctype html>
+<html lang="en-GB"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Macrobond release viewer</title>
+<style>
+:root{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e6e9ef;--dim:#8b93a3;
+--accent:#4c8dff;--x:#ff5c5c;--h:#ff9f43;--m:#f7d154;--l:#5a6273;--chip:#1f2530;}
+html[data-theme=light]{--bg:#f6f7f9;--card:#fff;--line:#e2e5ea;--fg:#1a1d23;
+--dim:#6b7280;--l:#c3c8d2;--chip:#eef1f5;}
+*{box-sizing:border-box;}
+body{margin:0;padding:24px;background:var(--bg);color:var(--fg);
+font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
+.top{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:4px;}
+h1{font-size:20px;margin:0;letter-spacing:-.01em;}
+.meta{color:var(--dim);font-size:12px;margin-bottom:18px;}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+padding:16px 18px;margin-bottom:18px;}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);
+margin:0 0 12px;font-weight:600;}
+.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px;}
+input[type=search],select{background:var(--chip);color:var(--fg);border:1px solid var(--line);
+border-radius:6px;padding:7px 10px;font:inherit;font-size:13px;}
+input[type=search]{min-width:230px;}
+input[type=range]{accent-color:var(--accent);vertical-align:middle;}
+button{background:var(--chip);color:var(--fg);border:1px solid var(--line);
+border-radius:6px;padding:7px 12px;font:inherit;font-size:13px;cursor:pointer;}
+button:hover{border-color:var(--accent);}
+button.on{background:var(--accent);border-color:var(--accent);color:#fff;}
+.lab{color:var(--dim);font-size:12px;}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;}
+.chip{background:var(--chip);border:1px solid var(--line);border-radius:999px;
+padding:4px 11px;font-size:12px;cursor:pointer;user-select:none;}
+.chip.on{background:var(--accent);border-color:var(--accent);color:#fff;}
+table{width:100%;border-collapse:collapse;}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.05em;
+color:var(--dim);font-weight:600;padding:0 8px 8px;border-bottom:1px solid var(--line);
+cursor:pointer;white-space:nowrap;}
+th:hover{color:var(--fg);}
+th .ar{opacity:.45;font-size:9px;}
+td{padding:8px;border-bottom:1px solid var(--line);vertical-align:top;}
+tr.row{cursor:pointer;}
+tr.row:hover td{background:rgba(127,127,127,.07);}
+.z{font-variant-numeric:tabular-nums;font-weight:600;width:66px;}
+tr.x .z{color:var(--x);} tr.h .z{color:var(--h);}
+tr.m .z{color:var(--m);} tr.l .z{color:var(--l);}
+.num{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap;}
+.reg{color:var(--dim);font-weight:600;width:48px;}
+.dt,.sp{color:var(--dim);white-space:nowrap;font-size:12px;}
+.desc .sub{display:block;color:var(--dim);font-size:11px;margin-top:2px;}
+.detail td{background:rgba(127,127,127,.05);font-size:13px;}
+.about{margin:0 0 10px;max-width:80ch;}
+.kv{display:flex;gap:26px;flex-wrap:wrap;color:var(--dim);font-size:12px;}
+.kv b{color:var(--fg);font-weight:600;}
+.note{color:var(--dim);font-size:12px;margin-top:10px;max-width:85ch;}
+.empty{color:var(--dim);padding:22px 8px;text-align:center;}
+details summary{cursor:pointer;color:var(--dim);font-size:12px;
+text-transform:uppercase;letter-spacing:.08em;font-weight:600;}
+#drop{border:2px dashed var(--line);border-radius:10px;padding:40px 20px;text-align:center;
+color:var(--dim);transition:border-color .15s,background .15s;}
+#drop.hot{border-color:var(--accent);background:rgba(76,141,255,.07);color:var(--fg);}
+#drop b{color:var(--fg);}
+#app{display:none;}
+.err{color:var(--x);margin-top:10px;}
+</style></head><body>
+
+<div class="top">
+  <h1>Macrobond release viewer</h1>
+  <span class="lab" id="hdrdate"></span>
+  <span style="flex:1"></span>
+  <button id="load">Load scan</button>
+  <button id="theme">Light</button>
+  <button id="export">Export CSV</button>
+</div>
+<div class="meta" id="meta">No scan loaded.</div>
+<input type="file" id="file" accept=".csv,.json" multiple style="display:none">
+
+<div class="card" id="dropcard">
+  <div id="drop">
+    <b>Drop a scan CSV here</b>, or click Load scan.<br>
+    Drop the <code>_calendar.csv</code> alongside it to see releases that produced no scored series.
+    <div class="err" id="err"></div>
+  </div>
+</div>
+
+<div id="app">
+<div class="card">
+  <div class="controls">
+    <input type="search" id="q" placeholder="Search series, release or source">
+    <select id="sort">
+      <option value="abs_z">Sort by significance</option>
+      <option value="z_desc">Sort by z, high to low</option>
+      <option value="z_asc">Sort by z, low to high</option>
+      <option value="trend">Sort by trend break</option>
+      <option value="region">Sort by region</option>
+      <option value="time">Sort by release time</option>
+    </select>
+    <select id="day"><option value="">All dates</option></select>
+    <span class="lab">Min |z| <b id="zval">0.0</b></span>
+    <input type="range" id="zmin" min="0" max="4" step="0.25" value="0">
+    <button id="limit" class="on">Top <span id="limn">50</span></button>
+    <span class="lab" id="count"></span>
+  </div>
+  <div class="chips" id="regions"></div>
+  <table>
+    <thead><tr>
+      <th data-k="z">z <span class="ar"></span></th>
+      <th data-k="region">Reg <span class="ar"></span></th>
+      <th data-k="description">Series <span class="ar"></span></th>
+      <th data-k="latest" class="num">Latest <span class="ar"></span></th>
+      <th data-k="previous" class="num">Prev <span class="ar"></span></th>
+      <th data-k="trend_break" class="num">Trend <span class="ar"></span></th>
+      <th data-k="pctile" class="num">Pctile <span class="ar"></span></th>
+      <th data-k="scored_on">On <span class="ar"></span></th>
+      <th data-k="obs_date">Obs <span class="ar"></span></th>
+    </tr></thead>
+    <tbody id="tb"></tbody>
+  </table>
+  <div class="note">z is the latest observation measured against a trailing window sized by
+  frequency, excluding the print itself. Series with a persistent drift are scored on their
+  period-on-period change rather than the level, and the On column says which. This is
+  deviation from a series' own history, not a surprise against consensus. Click any row for
+  the full description.</div>
+</div>
+
+<div class="card">
+  <details><summary>Release calendar</summary>
+    <table style="margin-top:12px">
+      <thead><tr><th>Date</th><th>Time</th><th>Reg</th><th>Release</th><th>Status</th></tr></thead>
+      <tbody id="cal"></tbody>
+    </table>
+  </details>
+</div>
+</div>
+
+<script>
+(function(){
+var rows = [], rels = [], meta = {};
+var state = {q:'', zmin:0, sort:'abs_z', regions:new Set(), limit:true,
+             sortKey:null, sortDir:-1, day:'', top:50};
+
+function esc(s){ return String(s==null?'':s)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+  .replace(/"/g,'&quot;'); }
+function band(z){ var a=Math.abs(z); return a>=3?'x':a>=2?'h':a>=1.25?'m':'l'; }
+
+// RFC4180 parser. The about column contains commas and may contain quotes,
+// so splitting on commas would silently shear the rows.
+function parseCSV(text){
+  text = text.replace(/^﻿/, '');
+  var rowsOut=[], row=[], field='', i=0, inQ=false;
+  while(i < text.length){
+    var c = text[i];
+    if(inQ){
+      if(c === '"'){
+        if(text[i+1] === '"'){ field += '"'; i += 2; continue; }
+        inQ = false; i++; continue;
+      }
+      field += c; i++; continue;
+    }
+    if(c === '"'){ inQ = true; i++; continue; }
+    if(c === ','){ row.push(field); field=''; i++; continue; }
+    if(c === '\r'){ i++; continue; }
+    if(c === '\n'){ row.push(field); rowsOut.push(row); row=[]; field=''; i++; continue; }
+    field += c; i++;
+  }
+  if(field.length || row.length){ row.push(field); rowsOut.push(row); }
+  if(!rowsOut.length) return [];
+  var head = rowsOut[0];
+  return rowsOut.slice(1).filter(function(r){ return r.length>1; }).map(function(r){
+    var o={}; head.forEach(function(h,idx){ o[h]= r[idx]===undefined?'':r[idx]; }); return o;
+  });
+}
+
+var NUMERIC = ['z','abs_z','trend_break','pctile','latest','previous','n_obs',
+               'window_obs','window_years'];
+function coerce(r){
+  NUMERIC.forEach(function(k){
+    if(r[k] !== undefined && r[k] !== ''){
+      var v = parseFloat(r[k]); if(!isNaN(v)) r[k] = v;
+    }
+  });
+  if(r.abs_z === undefined || r.abs_z === '') r.abs_z = Math.abs(r.z || 0);
+  return r;
+}
+
+function ingest(name, text){
+  var parsed = [];
+  if(/\.json$/i.test(name)){
+    var d = JSON.parse(text);
+    (d.rows||[]).forEach(function(r){ parsed.push(coerce(r)); });
+    if(d.releases) rels = rels.concat(d.releases);
+    meta.date = d.date_from && d.date_to && d.date_from!==d.date_to
+      ? d.date_from+' to '+d.date_to : (d.date||'');
+    meta.generated = d.generated||''; meta.regions = d.regions||'';
+    rows = rows.concat(parsed);
+    return parsed.length;
+  }
+  var recs = parseCSV(text);
+  if(!recs.length) return 0;
+  if(recs[0].z === undefined && recs[0].release !== undefined){
+    rels = rels.concat(recs);           // this is a _calendar.csv
+    return recs.length;
+  }
+  recs.forEach(function(r){ parsed.push(coerce(r)); });
+  rows = rows.concat(parsed);
+  return parsed.length;
+}
+
+function afterLoad(){
+  if(!rows.length){
+    document.getElementById('err').textContent =
+      'That file had no scored rows. Load the main scan CSV, not just the calendar.';
+    return;
+  }
+  document.getElementById('err').textContent='';
+  document.getElementById('dropcard').style.display='none';
+  document.getElementById('app').style.display='block';
+
+  var days = {};
+  rows.forEach(function(r){ if(r.release_date) days[r.release_date]=1; });
+  var dayList = Object.keys(days).sort();
+  if(!meta.date) meta.date = dayList.length>1
+    ? dayList[0]+' to '+dayList[dayList.length-1] : (dayList[0]||'');
+  var sel = document.getElementById('day');
+  sel.innerHTML = '<option value="">All dates</option>' +
+    dayList.map(function(d){ return '<option value="'+d+'">'+d+'</option>'; }).join('');
+  sel.style.display = dayList.length>1 ? '' : 'none';
+
+  document.getElementById('hdrdate').textContent = meta.date||'';
+  document.getElementById('meta').textContent =
+    rows.length+' series scored'+(rels.length? ' · '+rels.length+' releases':'')+
+    (meta.regions? ' · regions '+meta.regions:'')+
+    (meta.generated? ' · generated '+meta.generated:'');
+
+  var regs={};
+  rows.forEach(function(r){ if(r.region) regs[r.region]=(regs[r.region]||0)+1; });
+  var rc=document.getElementById('regions'); rc.innerHTML='';
+  Object.keys(regs).sort(function(a,b){return regs[b]-regs[a];}).forEach(function(k){
+    var el=document.createElement('span');
+    el.className='chip'; el.textContent=k.toUpperCase()+' '+regs[k];
+    el.onclick=function(){
+      if(state.regions.has(k)) state.regions.delete(k); else state.regions.add(k);
+      el.classList.toggle('on'); draw();
+    };
+    rc.appendChild(el);
+  });
+
+  document.getElementById('cal').innerHTML = rels.map(function(r){
+    var t=String(r.event_time_local||'').split(' ').pop();
+    return '<tr><td class="dt">'+esc(r.release_date||'')+'</td><td class="dt">'+esc(t)+
+      '</td><td class="reg">'+esc(String(r.region||'').toUpperCase())+'</td><td>'+
+      esc(r.description)+'</td><td class="sp">'+esc(r.status)+'</td></tr>';
+  }).join('') || '<tr><td colspan="5" class="empty">No calendar loaded.</td></tr>';
+
+  draw();
+}
+
+function filtered(){
+  var q=state.q.toLowerCase();
+  var out=rows.filter(function(r){
+    if(Math.abs(r.z) < state.zmin) return false;
+    if(state.day && r.release_date !== state.day) return false;
+    if(state.regions.size && !state.regions.has(r.region)) return false;
+    if(q){
+      var hay=(r.description+' '+r.release_description+' '+r.series+' '+
+               (r.about||'')+' '+(r.source||'')).toLowerCase();
+      if(hay.indexOf(q)===-1) return false;
+    }
+    return true;
+  });
+  if(state.sortKey){
+    var k=state.sortKey, d=state.sortDir;
+    out.sort(function(a,b){
+      var x=a[k], y=b[k];
+      var nx=parseFloat(x), ny=parseFloat(y);
+      if(!isNaN(nx)&&!isNaN(ny)) return (nx-ny)*d;
+      return String(x).localeCompare(String(y))*d;
+    });
+  } else {
+    var s=state.sort;
+    out.sort(function(a,b){
+      if(s==='abs_z') return Math.abs(b.z)-Math.abs(a.z);
+      if(s==='z_desc') return b.z-a.z;
+      if(s==='z_asc') return a.z-b.z;
+      if(s==='trend') return Math.abs(b.trend_break)-Math.abs(a.trend_break);
+      if(s==='region') return String(a.region).localeCompare(String(b.region))
+                            || Math.abs(b.z)-Math.abs(a.z);
+      if(s==='time') return String(a.event_time_local).localeCompare(String(b.event_time_local));
+      return 0;
+    });
+  }
+  return out;
+}
+
+function draw(){
+  var all=filtered();
+  var show=state.limit? all.slice(0,state.top) : all;
+  document.getElementById('count').textContent =
+    'showing '+show.length+' of '+all.length+
+    (all.length!==rows.length? ' ('+rows.length+' total)':'');
+  var tb=document.getElementById('tb');
+  if(!show.length){
+    tb.innerHTML='<tr><td colspan="9" class="empty">Nothing matches these filters.</td></tr>';
+    return;
+  }
+  var html='';
+  show.forEach(function(r,i){
+    html += '<tr class="row '+band(r.z)+'" data-i="'+i+'">'
+      + '<td class="z">'+(r.z>0?'+':'')+Number(r.z).toFixed(2)+'</td>'
+      + '<td class="reg">'+esc(String(r.region).toUpperCase())+'</td>'
+      + '<td class="desc">'+esc(r.description)
+      + '<span class="sub">'+esc(r.release_description)
+      + (r.release_date? ' · '+esc(r.release_date):'')
+      + (r.event_time_local? ' '+esc(String(r.event_time_local).split(' ').pop()):'')
+      + '</span></td>'
+      + '<td class="num">'+esc(r.latest)+'</td>'
+      + '<td class="num">'+esc(r.previous)+'</td>'
+      + '<td class="num">'+(r.trend_break>0?'+':'')+Number(r.trend_break).toFixed(2)+'</td>'
+      + '<td class="num">'+Number(r.pctile).toFixed(0)+'</td>'
+      + '<td class="sp">'+esc(r.scored_on)+'</td>'
+      + '<td class="dt">'+esc(r.obs_date)+'</td></tr>'
+      + '<tr class="detail" id="d'+i+'" style="display:none"><td colspan="9">'
+      + '<p class="about">'+esc(r.about||r.description)+'</p>'
+      + '<div class="kv">'
+      + '<span>Verdict <b>'+esc(r.verdict)+'</b></span>'
+      + '<span>Code <b>'+esc(r.series)+'</b></span>'
+      + (r.unit?'<span>Unit <b>'+esc(r.unit)+'</b></span>':'')
+      + (r.frequency?'<span>Frequency <b>'+esc(r.frequency)+'</b></span>':'')
+      + (r.source?'<span>Source <b>'+esc(r.source)+'</b></span>':'')
+      + '<span>History <b>'+esc(r.n_obs)+' obs</b></span>'
+      + (r.window_obs?'<span>Benchmark <b>'+esc(r.window_obs)+' obs / '+
+         esc(r.window_years)+' yrs</b></span>':'')
+      + (r.scale_kind?'<span>Scale <b>'+esc(r.scale_kind)+'</b></span>':'')
+      + '<span>Status <b>'+esc(r.status)+'</b></span>'
+      + '</div></td></tr>';
+  });
+  tb.innerHTML=html;
+  Array.prototype.forEach.call(tb.querySelectorAll('tr.row'), function(tr){
+    tr.onclick=function(){
+      var d=document.getElementById('d'+tr.getAttribute('data-i'));
+      d.style.display = d.style.display==='none'?'table-row':'none';
+    };
+  });
+}
+
+// ---- file loading -------------------------------------------------------
+function readFiles(files){
+  var pending = files.length, loaded = 0;
+  if(!pending) return;
+  Array.prototype.forEach.call(files, function(f){
+    var fr = new FileReader();
+    fr.onload = function(){
+      try { loaded += ingest(f.name, fr.result); }
+      catch(e){ document.getElementById('err').textContent =
+        'Could not read '+f.name+': '+e.message; }
+      if(--pending === 0) afterLoad();
+    };
+    fr.onerror = function(){
+      document.getElementById('err').textContent = 'Could not read '+f.name;
+      if(--pending === 0) afterLoad();
+    };
+    fr.readAsText(f);
+  });
+}
+document.getElementById('load').onclick=function(){ document.getElementById('file').click(); };
+document.getElementById('file').onchange=function(e){ readFiles(e.target.files); };
+var drop=document.getElementById('drop');
+['dragenter','dragover'].forEach(function(ev){
+  document.addEventListener(ev,function(e){ e.preventDefault(); drop.classList.add('hot'); });
+});
+['dragleave','drop'].forEach(function(ev){
+  document.addEventListener(ev,function(e){ e.preventDefault();
+    if(ev==='drop'||e.target===drop) drop.classList.remove('hot'); });
+});
+document.addEventListener('drop',function(e){
+  e.preventDefault();
+  document.getElementById('dropcard').style.display='';
+  if(e.dataTransfer && e.dataTransfer.files.length) readFiles(e.dataTransfer.files);
+});
+
+// ---- controls -----------------------------------------------------------
+document.getElementById('q').oninput=function(e){ state.q=e.target.value; draw(); };
+document.getElementById('sort').onchange=function(e){
+  state.sort=e.target.value; state.sortKey=null; markSort(); draw(); };
+document.getElementById('day').onchange=function(e){ state.day=e.target.value; draw(); };
+document.getElementById('zmin').oninput=function(e){
+  state.zmin=parseFloat(e.target.value);
+  document.getElementById('zval').textContent=state.zmin.toFixed(1); draw(); };
+document.getElementById('limit').onclick=function(){
+  state.limit=!state.limit; this.classList.toggle('on',state.limit);
+  this.firstChild.textContent = state.limit?'Top ':'Show all '; draw(); };
+
+function markSort(){
+  Array.prototype.forEach.call(document.querySelectorAll('th .ar'),function(a){a.textContent='';});
+  if(state.sortKey){
+    var th=document.querySelector('th[data-k="'+state.sortKey+'"]');
+    if(th) th.querySelector('.ar').textContent = state.sortDir<0?'▼':'▲';
+  }
+}
+Array.prototype.forEach.call(document.querySelectorAll('th[data-k]'),function(th){
+  th.onclick=function(){
+    var k=th.getAttribute('data-k');
+    if(state.sortKey===k) state.sortDir=-state.sortDir;
+    else { state.sortKey=k; state.sortDir=-1; }
+    markSort(); draw();
+  };
+});
+document.getElementById('theme').onclick=function(){
+  var light=document.documentElement.getAttribute('data-theme')==='light';
+  document.documentElement.setAttribute('data-theme', light?'dark':'light');
+  this.textContent = light?'Light':'Dark';
+};
+document.getElementById('export').onclick=function(){
+  if(!rows.length) return;
+  var cols=['release_date','z','region','series','description','about',
+            'release_description','latest','previous','trend_break','pctile',
+            'scored_on','obs_date','unit','frequency','source','n_obs','verdict'];
+  var out=[cols.join(',')];
+  filtered().forEach(function(r){
+    out.push(cols.map(function(c){
+      var v=r[c]==null?'':String(r[c]);
+      return /[",\n]/.test(v)? '"'+v.replace(/"/g,'""')+'"' : v;
+    }).join(','));
+  });
+  var blob=new Blob([out.join('\n')],{type:'text/csv'});
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='macrobond_filtered.csv'; a.click();
+};
+})();
+</script>
+</body></html>"""
 
 
 def render_html(payload: Dict[str, Any], top: int) -> str:
@@ -1996,6 +2548,87 @@ def run_selftest() -> int:
     check("kv parser handles pairs", _parse_kv("A=1,B=2") == {"A": "1", "B": "2"})
     check("kv parser ignores junk", _parse_kv("nonsense,,C=3") == {"C": "3"})
 
+    # 9g. date window resolution
+    class A:
+        def __init__(self, **kw):
+            self.date = kw.get("date"); self.date_from = kw.get("date_from")
+            self.date_to = kw.get("date_to"); self.days = kw.get("days", 1)
+            self.outdir = kw.get("outdir", "."); self.flat = kw.get("flat", False)
+
+    s, e = resolve_dates(A(date="2026-08-17"))
+    check("single date gives a one-day window", s == e == date(2026, 8, 17))
+    s, e = resolve_dates(A(date="2026-08-17", days=2))
+    check("--days 2 covers yesterday and today",
+          s == date(2026, 8, 16) and e == date(2026, 8, 17), f"got {s} to {e}")
+    s, e = resolve_dates(A(date_from="2026-08-10", date_to="2026-08-14"))
+    check("--from/--to honoured", s == date(2026, 8, 10) and e == date(2026, 8, 14))
+    s, e = resolve_dates(A(date_from="2026-08-14", date_to="2026-08-10"))
+    check("reversed range is corrected", s == date(2026, 8, 10) and e == date(2026, 8, 14))
+    s, e = resolve_dates(A(date_to="2026-08-14"))
+    check("--to alone is a single day", s == e == date(2026, 8, 14))
+
+    range_ents = [
+        {"Name": "r1", "Description": "D1", "Region": "us",
+         "LastReleaseEventTime": "2026-08-14T12:30:00Z"},
+        {"Name": "r2", "Description": "D2", "Region": "gb",
+         "LastReleaseEventTime": "2026-08-17T09:00:00Z"},
+        {"Name": "r3", "Description": "D3", "Region": "de",
+         "LastReleaseEventTime": "2026-08-20T09:00:00Z"},
+    ]
+    span_hits = releases_in_range(range_ents, date(2026, 8, 14), date(2026, 8, 17), 0.0)
+    check("range picks up both ends inclusively", len(span_hits) == 2, f"got {len(span_hits)}")
+    check("out-of-range release excluded",
+          not any(h["release"] == "r3" for h in span_hits))
+    check("each hit is tagged with its release date",
+          sorted(h["release_date"] for h in span_hits) == ["2026-08-14", "2026-08-17"])
+    check("single-day wrapper still works",
+          len(releases_on_day(range_ents, date(2026, 8, 14), 0.0)) == 1)
+
+    # 9h. output paths
+    d, stem = output_paths({"date": "2026-08-17"}, "/out", False)
+    check("single-day path is filed under year/month",
+          d == os.path.join("/out", "2026", "08") and stem == "macrobond_releases_2026-08-17",
+          f"got {d} {stem}")
+    d, stem = output_paths({"date": "2026-08-17", "date_from": "2026-08-14",
+                            "date_to": "2026-08-17"}, "/out", False)
+    check("range stem names both dates", stem == "macrobond_releases_2026-08-14_to_2026-08-17",
+          f"got {stem}")
+    d, stem = output_paths({"date_from": "2026-07-30", "date_to": "2026-08-02",
+                            "date": "2026-08-02"}, "/out", False)
+    check("range crossing a month files under the end month",
+          d == os.path.join("/out", "2026", "08"), f"got {d}")
+    d, _ = output_paths({"date": "2026-08-17"}, "/out", True)
+    check("--flat writes to the root", d == "/out", f"got {d}")
+
+    # 9i. the viewer must survive a round trip through its own CSV parser
+    viewer = render_viewer()
+    check("viewer is self-contained", "cdn" not in viewer.lower()
+          and "fetch(" not in viewer)
+    check("viewer has a real CSV parser", "RFC4180" in viewer)
+    check("viewer takes csv and json", 'accept=".csv,.json"' in viewer)
+
+    tricky = [{"release_date": "2026-08-17", "release": "rel_a",
+               "release_description": "US CPI", "region": "us", "status": "Released",
+               "event_time_local": "2026-08-17 13:30", "series": "uscpi",
+               "description": 'Prices, "all items", ex food',
+               "about": "A sentence, with commas, and \"quotes\" inside it.",
+               "source": "BLS", "unit": "Index", "frequency": "monthly",
+               "obs_date": "2026-07-01", "latest": 321.4, "previous": 320.1,
+               "scored_on": "change", "z": 2.83, "abs_z": 2.83, "trend_break": 1.2,
+               "pctile": 98.0, "n_obs": 79, "window_obs": 36, "window_years": 3.0,
+               "scale_kind": "winsor", "verdict": "Notable print"}]
+    import io
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=CSV_FIELDS, extrasaction="ignore")
+    w.writeheader(); w.writerows(tricky)
+    text = buf.getvalue()
+    reread = list(csv.DictReader(io.StringIO(text)))
+    check("quoted commas survive the CSV round trip",
+          reread[0]["about"] == tricky[0]["about"], f"got {reread[0]['about']!r}")
+    check("embedded quotes survive too",
+          reread[0]["description"] == tricky[0]["description"])
+    check("release_date is the first CSV column", CSV_FIELDS[0] == "release_date")
+
     hits = releases_on_day(ents, date(2026, 8, 17), 0.0)
     check("two releases match the target day", len(hits) == 2, f"got {len(hits)}")
     check("released vs upcoming split correctly",
@@ -2025,6 +2658,13 @@ def _parse_kv(text: str) -> Dict[str, Any]:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Macrobond release calendar scan")
     ap.add_argument("--date", help="YYYY-MM-DD, defaults to today")
+    ap.add_argument("--from", dest="date_from", metavar="YYYY-MM-DD",
+                    help="start of the scan window, inclusive")
+    ap.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD",
+                    help="end of the scan window, inclusive. Defaults to today")
+    ap.add_argument("--days", type=int, default=1, metavar="N",
+                    help="scan the last N days ending on --date. --days 2 catches up "
+                         "yesterday and today in one run")
     ap.add_argument("--regions", default="dm-em",
                     help="preset (core, dm, dm-em, all) or a comma separated list of "
                          "region codes. An explicit list overrides the exclusions")
@@ -2074,7 +2714,18 @@ def main() -> int:
                          "past dislocations do not inflate it. mad is more resistant "
                          "but noisier. sd is the classic estimator, easily wrecked by "
                          "a COVID-sized observation in the window")
-    ap.add_argument("--outdir", default=".", help="where to write CSV/JSON/HTML")
+    ap.add_argument("--outdir", default=".",
+                    help="root of the output tree. Scans are filed under Year/Month "
+                         "inside it, the viewer sits at the root")
+    ap.add_argument("--flat", action="store_true",
+                    help="write straight into --outdir instead of Year/Month folders")
+    ap.add_argument("--no-viewer", action="store_true",
+                    help="do not create or refresh release_viewer.html")
+    ap.add_argument("--force-viewer", action="store_true",
+                    help="overwrite release_viewer.html, needed after a script update")
+    ap.add_argument("--self-contained", action="store_true",
+                    help="also write the old per-scan HTML with the data baked in")
+    ap.add_argument("--no-json", action="store_true", help="skip the JSON output")
     ap.add_argument("--probe", action="store_true",
                     help="dump Release entity metadata shape and exit")
     ap.add_argument("--selftest", action="store_true",
