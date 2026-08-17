@@ -143,9 +143,27 @@ function esc(s){ return String(s==null?'':s)
   .replace(/"/g,'&quot;'); }
 function band(z){ var a=Math.abs(z); return a>=3?'x':a>=2?'h':a>=1.25?'m':'l'; }
 
+// Work out the delimiter from the header line. Excel writes semicolons under
+// some locales, and a comma-only parser turns that into one giant column with
+// no visible error.
+function sniffDelim(text){
+  var line = text.split(/\r?\n/)[0] || '';
+  var counts = {',':0, ';':0, '\t':0}, inQ = false;
+  for(var i=0;i<line.length;i++){
+    var c = line[i];
+    if(c === '"'){ inQ = !inQ; continue; }
+    if(!inQ && counts[c] !== undefined) counts[c]++;
+  }
+  var best = ',';
+  if(counts[';'] > counts[best]) best = ';';
+  if(counts['\t'] > counts[best]) best = '\t';
+  return best;
+}
+
 // RFC4180 parser. The about column contains commas and may contain quotes,
-// so splitting on commas would silently shear the rows.
-function parseCSV(text){
+// so splitting on the delimiter alone would silently shear the rows.
+function parseCSV(text, delim){
+  delim = delim || ',';
   text = text.replace(/^﻿/, '');
   var rowsOut=[], row=[], field='', i=0, inQ=false;
   while(i < text.length){
@@ -158,7 +176,7 @@ function parseCSV(text){
       field += c; i++; continue;
     }
     if(c === '"'){ inQ = true; i++; continue; }
-    if(c === ','){ row.push(field); field=''; i++; continue; }
+    if(c === delim){ row.push(field); field=''; i++; continue; }
     if(c === '\r'){ i++; continue; }
     if(c === '\n'){ row.push(field); rowsOut.push(row); row=[]; field=''; i++; continue; }
     field += c; i++;
@@ -183,33 +201,83 @@ function coerce(r){
   return r;
 }
 
+// Returns a report rather than a bare count, so that when nothing loads we can
+// say which of the several possible reasons actually applied.
 function ingest(name, text){
+  var rep = {name:name, bytes:text.length, kind:'unknown', count:0,
+             headers:[], delim:','};
   var parsed = [];
+
   if(/\.json$/i.test(name)){
-    var d = JSON.parse(text);
-    (d.rows||[]).forEach(function(r){ parsed.push(coerce(r)); });
-    if(d.releases) rels = rels.concat(d.releases);
-    meta.date = d.date_from && d.date_to && d.date_from!==d.date_to
-      ? d.date_from+' to '+d.date_to : (d.date||'');
-    meta.generated = d.generated||''; meta.regions = d.regions||'';
-    rows = rows.concat(parsed);
-    return parsed.length;
+    try {
+      var d = JSON.parse(text);
+      (d.rows||[]).forEach(function(r){ parsed.push(coerce(r)); });
+      if(d.releases) rels = rels.concat(d.releases);
+      meta.date = d.date_from && d.date_to && d.date_from!==d.date_to
+        ? d.date_from+' to '+d.date_to : (d.date||'');
+      meta.generated = d.generated||''; meta.regions = d.regions||'';
+      rows = rows.concat(parsed);
+      rep.kind = 'scan'; rep.count = parsed.length;
+    } catch(e){ rep.kind = 'badjson'; rep.error = e.message; }
+    return rep;
   }
-  var recs = parseCSV(text);
-  if(!recs.length) return 0;
+
+  rep.delim = sniffDelim(text);
+  var recs = parseCSV(text, rep.delim);
+  var headerLine = (text.replace(/^﻿/, '').split(/\r?\n/)[0] || '');
+  rep.headers = recs.length ? Object.keys(recs[0]) : headerLine.split(rep.delim);
+
+  if(!recs.length){ rep.kind = 'empty'; return rep; }
   if(recs[0].z === undefined && recs[0].release !== undefined){
     rels = rels.concat(recs);           // this is a _calendar.csv
-    return recs.length;
+    rep.kind = 'calendar'; rep.count = recs.length;
+    return rep;
   }
+  if(recs[0].z === undefined){ rep.kind = 'unrecognised'; return rep; }
+
   recs.forEach(function(r){ parsed.push(coerce(r)); });
   rows = rows.concat(parsed);
-  return parsed.length;
+  rep.kind = 'scan'; rep.count = parsed.length;
+  return rep;
 }
 
-function afterLoad(){
+function diagnose(reports){
+  var lines = [];
+  var kinds = reports.map(function(r){ return r.kind; });
+
+  if(kinds.length && kinds.every(function(k){ return k === 'calendar'; })){
+    var suggest = reports[0].name.replace(/_calendar\.csv$/i, '.csv');
+    lines.push('That is the calendar file, which lists releases but holds no scores.');
+    lines.push('Drop ' + suggest + ' instead, from the same folder.');
+    return lines;
+  }
+  reports.forEach(function(r){
+    if(r.kind === 'empty'){
+      var looksRight = r.headers.indexOf('z') !== -1;
+      lines.push(r.name + ': header row present but no data rows.');
+      lines.push(looksRight
+        ? 'This is a valid scan file that scored nothing. Check the scan console for '
+          + '"N series scored" — if N is 0, the problem is upstream, not here.'
+        : 'The header does not look like a scan file. Columns found: '
+          + (r.headers.join(', ') || '(none)'));
+    } else if(r.kind === 'unrecognised'){
+      lines.push(r.name + ': parsed ' + r.bytes + ' bytes with delimiter "'
+        + (r.delim === '\t' ? 'tab' : r.delim) + '" but found no z column.');
+      lines.push('Columns found: ' + (r.headers.slice(0, 12).join(', ') || '(none)'));
+      if(r.delim !== ',') lines.push('If this file was re-saved by Excel, save it as CSV again.');
+    } else if(r.kind === 'badjson'){
+      lines.push(r.name + ': not valid JSON (' + (r.error||'') + ').');
+    }
+  });
+  if(!lines.length) lines.push('No scored rows found in the file(s) dropped.');
+  return lines;
+}
+
+function afterLoad(reports){
   if(!rows.length){
-    document.getElementById('err').textContent =
-      'That file had no scored rows. Load the main scan CSV, not just the calendar.';
+    var lines = diagnose(reports || []);
+    document.getElementById('err').innerHTML =
+      '<b>Nothing loaded.</b><br>' + lines.map(esc).join('<br>');
     return;
   }
   document.getElementById('err').textContent='';
@@ -345,19 +413,21 @@ function draw(){
 
 // ---- file loading -------------------------------------------------------
 function readFiles(files){
-  var pending = files.length, loaded = 0;
+  var pending = files.length, reports = [];
   if(!pending) return;
+  rows = []; rels = []; meta = {};      // a fresh drop replaces the last one
   Array.prototype.forEach.call(files, function(f){
     var fr = new FileReader();
     fr.onload = function(){
-      try { loaded += ingest(f.name, fr.result); }
-      catch(e){ document.getElementById('err').textContent =
-        'Could not read '+f.name+': '+e.message; }
-      if(--pending === 0) afterLoad();
+      try { reports.push(ingest(f.name, fr.result)); }
+      catch(e){ reports.push({name:f.name, kind:'error', error:e.message,
+                              bytes:0, headers:[], delim:','}); }
+      if(--pending === 0) afterLoad(reports);
     };
     fr.onerror = function(){
-      document.getElementById('err').textContent = 'Could not read '+f.name;
-      if(--pending === 0) afterLoad();
+      reports.push({name:f.name, kind:'error', error:'unreadable',
+                    bytes:0, headers:[], delim:','});
+      if(--pending === 0) afterLoad(reports);
     };
     fr.readAsText(f);
   });
