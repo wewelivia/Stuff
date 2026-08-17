@@ -49,6 +49,49 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 CORE_REGIONS = ["us", "ea", "de", "fr", "it", "es", "gb", "jp", "cn"]
 
+# Region presets. Codes assumed to be ISO 3166-1 alpha-2 lowercase, plus 'ea'
+# for the euro area. Run --list-regions to print what Macrobond actually uses
+# and reconcile before trusting a long list.
+DEVELOPED = [
+    "us", "ca", "gb", "ea", "de", "fr", "it", "es", "nl", "be", "at", "ie",
+    "pt", "gr", "fi", "lu", "ch", "no", "se", "dk", "is", "jp", "au", "nz",
+    "sg", "hk", "kr", "tw", "il",
+]
+
+# Mainstream EM with a macro calendar that moves global rates or FX.
+EM_MAJOR = [
+    "cn", "in", "id", "my", "th", "ph", "br", "mx", "cl", "co", "pe",
+    "pl", "cz", "hu", "ro", "tr", "sa", "ae", "za",
+]
+
+# Excluded by default under the 'all' preset.
+AFRICA = [
+    "dz", "ao", "bj", "bw", "bf", "bi", "cm", "cv", "cf", "td", "km", "cd",
+    "cg", "ci", "dj", "eg", "gq", "er", "et", "ga", "gm", "gh", "gn", "gw",
+    "ke", "ls", "lr", "ly", "mg", "mw", "ml", "mr", "mu", "ma", "mz", "na",
+    "ne", "ng", "rw", "sn", "sc", "sl", "so", "ss", "sd", "sz", "tz", "tg",
+    "tn", "ug", "zm", "zw",
+]
+# South Africa is deliberately NOT in the list above. It is the one African
+# market with a policy calendar that feeds global EM rates pricing. Add "za"
+# to AFRICA if you would rather drop it too.
+
+FRONTIER = [
+    "bd", "lk", "pk", "vn", "kz", "uz", "ge", "am", "az", "by", "ua", "rs",
+    "hr", "si", "bg", "mk", "al", "ba", "md", "mn", "np", "kh", "la", "mm",
+    "bh", "om", "jo", "lb", "iq", "ir", "ve", "ec", "bo", "py", "uy", "do",
+    "gt", "cr", "pa", "sv", "hn", "ni", "jm", "tt", "cy", "mt", "ee", "lv",
+    "lt", "sk",
+]
+
+REGION_PRESETS: Dict[str, Optional[List[str]]] = {
+    "core": CORE_REGIONS,
+    "dm": DEVELOPED,
+    "dm-em": DEVELOPED + EM_MAJOR,
+    "all": None,            # no include filter, exclusions still apply
+}
+DEFAULT_EXCLUDED = AFRICA + FRONTIER
+
 # Words that suggest a series is the headline aggregate of its release rather
 # than a component. Used to prioritise which series to score when a release
 # carries hundreds of members.
@@ -59,6 +102,32 @@ HEADLINE_HINTS = (
 COMPONENT_PENALTY = (
     "by region", "by state", "by county", "by province", "excluding",
     "detail", "sub-", "breakdown", "of which", "contribution",
+)
+
+# --- economic vs company releases -----------------------------------------
+# Macrobond carries corporate earnings releases alongside economic ones. Until
+# the probe tells us the definitive discriminator attribute, we exclude on
+# structural markers first and fall back to wording.
+
+# Presence of any of these attributes means the release is tied to an issuer.
+COMPANY_MARKER_ATTRS = (
+    "Company", "CompanyId", "CompanyName", "Security", "SecurityId",
+    "Isin", "Cusip", "Sedol", "Ticker", "Exchange", "GicsSector", "GicsIndustry",
+)
+
+# Attributes that plausibly hold a release type. Checked against the patterns
+# below. The probe prints the value distribution of each so we can confirm.
+TYPE_LIKE_ATTRS = (
+    "ReleaseType", "EntityType", "Class", "Category", "Group", "Kind", "Type",
+)
+COMPANY_TYPE_PATTERNS = ("compan", "corporate", "earning", "issuer", "security", "equity")
+ECONOMIC_TYPE_PATTERNS = ("econom", "macro", "statistic", "indicator")
+
+# Last-resort wording check on the description.
+COMPANY_TEXT_PATTERNS = (
+    "earnings", "quarterly results", "annual results", "interim results",
+    "financial results", "trading update", "annual report", "10-q", "10-k",
+    "results release", "profit", "dividend",
 )
 
 MIN_OBS_FOR_SCORE = 24          # need this many trailing points to compute z
@@ -124,15 +193,149 @@ def _safe_float(value: Any) -> Optional[float]:
     return f
 
 
-def _meta(entity: Any, key: str, default: Any = None) -> Any:
+def _as_mapping(entity: Any) -> Dict[str, Any]:
+    """
+    entity_search returns a sequence of METADATA MAPPINGS, not Entity objects
+    (SearchResult.entities is documented as "a sequence of the metadata of the
+    entities found"). get_series and get_entities do return Entity objects with
+    a .metadata mapping. Normalise both to a plain dict.
+    """
+    if isinstance(entity, dict):
+        return entity
     md = getattr(entity, "metadata", None)
-    if not isinstance(md, dict):
-        return default
+    if isinstance(md, dict):
+        return md
+    if md is not None:
+        try:
+            return dict(md)
+        except Exception:
+            pass
+    try:
+        return dict(entity)          # mapping-like but not a dict
+    except Exception:
+        return {}
+
+
+def _meta(entity: Any, key: str, default: Any = None) -> Any:
+    md = _as_mapping(entity)
     if key in md:
         return _first(md[key])
     # Macrobond metadata keys are case sensitive but be forgiving anyway
     lowered = {k.lower(): v for k, v in md.items()}
-    return _first(lowered.get(key.lower(), default))
+    if key.lower() in lowered:
+        return _first(lowered[key.lower()])
+    return default
+
+
+def _entity_name(entity: Any) -> Optional[str]:
+    """Name is a metadata key on search results, an attribute on entities."""
+    for key in ("Name", "PrimName", "PrimaryName"):
+        name = _meta(entity, key)
+        if name:
+            return str(name)
+    name = getattr(entity, "name", None)
+    return str(name) if name else None
+
+
+def resolve_regions(spec: str, extra_excludes: str = "",
+                    keep_excluded: bool = False) -> Tuple[Optional[List[str]], set]:
+    """
+    Turn a --regions value into (include list or None, exclusion set).
+
+    Accepts a preset name ('core', 'dm', 'dm-em', 'all') or a comma separated
+    list of codes. An explicit list is taken at face value: if you name a
+    country you get it, exclusions do not silently override you.
+    """
+    spec = (spec or "core").strip().lower()
+    excluded = set() if keep_excluded else set(DEFAULT_EXCLUDED)
+    excluded |= {c.strip().lower() for c in (extra_excludes or "").split(",") if c.strip()}
+
+    if spec in REGION_PRESETS:
+        include = REGION_PRESETS[spec]
+        if include is not None:
+            include = [r for r in include if r not in excluded]
+        return include, excluded
+
+    include = [c.strip().lower() for c in spec.split(",") if c.strip()]
+    # explicit list wins over the default exclusions
+    excluded -= set(include)
+    return include, excluded
+
+
+def drop_excluded_regions(releases: List[Any], excluded: set,
+                          verbose: bool = True) -> List[Any]:
+    """Post-hoc region exclusion, needed for the 'all' preset."""
+    if not excluded:
+        return releases
+    kept, dropped = [], {}
+    for ent in releases:
+        region = str(_meta(ent, "Region") or "").lower()
+        if region and region in excluded:
+            dropped[region] = dropped.get(region, 0) + 1
+        else:
+            kept.append(ent)
+    if verbose and dropped:
+        total = sum(dropped.values())
+        top = ", ".join(f"{r}({n})" for r, n in
+                        sorted(dropped.items(), key=lambda kv: -kv[1])[:10])
+        print(f"  excluded {total} releases from {len(dropped)} excluded regions: {top}")
+    return kept
+
+
+def classify_release(entity: Any) -> Tuple[str, str]:
+    """
+    Return (kind, reason) where kind is 'economic', 'company' or 'unknown'.
+
+    Ordered from most to least reliable: structural attributes that only an
+    issuer-linked release would carry, then an explicit type attribute, then
+    the wording of the description.
+    """
+    md = _as_mapping(entity)
+    lowered = {k.lower(): v for k, v in md.items()}
+
+    for attr in COMPANY_MARKER_ATTRS:
+        if attr.lower() in lowered and lowered[attr.lower()] not in (None, "", []):
+            return "company", f"has {attr}"
+
+    for attr in TYPE_LIKE_ATTRS:
+        raw = lowered.get(attr.lower())
+        if raw in (None, "", []):
+            continue
+        text = str(_first(raw)).lower()
+        if any(p in text for p in COMPANY_TYPE_PATTERNS):
+            return "company", f"{attr}={text}"
+        if any(p in text for p in ECONOMIC_TYPE_PATTERNS):
+            return "economic", f"{attr}={text}"
+
+    desc = str(_meta(entity, "Description") or _meta(entity, "FullDescription") or "").lower()
+    if any(p in desc for p in COMPANY_TEXT_PATTERNS):
+        return "company", "description wording"
+
+    # An economic release is region-scoped and sourced from a statistical body.
+    if _meta(entity, "Region"):
+        return "economic", "has Region, no company markers"
+
+    return "unknown", "no discriminator found"
+
+
+def filter_releases_by_kind(releases: List[Any], kind: str,
+                            verbose: bool = True) -> List[Any]:
+    if kind == "all":
+        return releases
+    kept, dropped = [], {}
+    for ent in releases:
+        k, reason = classify_release(ent)
+        # 'unknown' is kept when asking for economic: better a false positive we
+        # can see in the report than a silently missing release.
+        if k == kind or (kind == "economic" and k == "unknown"):
+            kept.append(ent)
+        else:
+            dropped[reason] = dropped.get(reason, 0) + 1
+    if verbose and dropped:
+        print(f"  excluded {sum(dropped.values())} non-{kind} releases:")
+        for reason, n in sorted(dropped.items(), key=lambda kv: -kv[1])[:8]:
+            print(f"    {n:>5}  {reason}")
+    return kept
 
 
 # --------------------------------------------------------------------------
@@ -240,29 +443,84 @@ def open_client(mode: str):
     return WebClient()
 
 
-def fetch_releases(api, regions: Optional[List[str]], verbose: bool = True) -> List[Any]:
-    """All Release entities, optionally narrowed by region."""
-    attempts: List[Dict[str, Any]] = []
-    if regions:
-        attempts.append({"entity_types": ["Release"], "must_have_values": {"Region": regions}})
-    attempts.append({"entity_types": ["Release"], "must_have_attributes": ["NextReleaseEventTime"]})
-    attempts.append({"entity_types": ["Release"]})
+SEARCH_CAP = 2000   # Macrobond truncates entity_search at this many results
 
-    for i, kwargs in enumerate(attempts, 1):
-        try:
-            result = api.entity_search(**kwargs)
-            entities = list(result)
-            if entities:
-                if verbose:
-                    print(f"  release search #{i} returned {len(entities)} entities "
-                          f"({', '.join(kwargs.keys())})")
-                return entities
-            if verbose:
-                print(f"  release search #{i} returned nothing, falling back")
-        except Exception as exc:  # noqa: BLE001
-            if verbose:
-                print(f"  release search #{i} failed: {exc}")
-    return []
+
+def _search(api, verbose: bool, **kwargs) -> Tuple[List[Any], bool]:
+    """Run one entity_search. Returns (rows, was_truncated)."""
+    try:
+        result = api.entity_search(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        if verbose:
+            print(f"    search failed ({kwargs}): {exc}")
+        return [], False
+    rows = list(result)
+    truncated = bool(getattr(result, "is_truncated", False)) or len(rows) >= SEARCH_CAP
+    return rows, truncated
+
+
+def fetch_releases(api, regions: Optional[List[str]], verbose: bool = True,
+                   must_have: Optional[Dict[str, Any]] = None,
+                   must_not_have: Optional[Dict[str, Any]] = None,
+                   must_not_have_attributes: Optional[List[str]] = None) -> List[Any]:
+    """
+    All Release entities, optionally narrowed by region.
+
+    Macrobond truncates a search at 2000 results, so we query one region at a
+    time and merge. That keeps each call well under the cap and makes any
+    remaining truncation visible per region rather than silently global.
+
+    Extra filters are pushed into the search itself, which both shrinks the
+    result and keeps us under the cap. Use these once the probe has confirmed
+    the attribute that separates economic from company releases.
+    """
+    collected: Dict[str, Any] = {}
+    truncated_regions: List[str] = []
+
+    extra: Dict[str, Any] = {}
+    if must_not_have:
+        extra["must_not_have_values"] = must_not_have
+    if must_not_have_attributes:
+        extra["must_not_have_attributes"] = list(must_not_have_attributes)
+
+    def absorb(rows: Iterable[Any]) -> None:
+        for row in rows:
+            name = _entity_name(row)
+            if name:
+                collected[name] = row
+
+    targets = regions if regions else [None]
+    for region in targets:
+        values = dict(must_have or {})
+        if region:
+            values["Region"] = region
+        kwargs: Dict[str, Any] = {"entity_types": ["Release"], **extra}
+        if values:
+            kwargs["must_have_values"] = values
+
+        rows, truncated = _search(api, verbose, **kwargs)
+        if not rows and region:
+            # some releases may not carry a Region attribute at all
+            rows, truncated = _search(api, verbose, entity_types=["Release"],
+                                      text=region, **extra)
+        absorb(rows)
+        if truncated:
+            truncated_regions.append(region or "all")
+        if verbose:
+            print(f"    {region or 'all'}: {len(rows)} releases"
+                  f"{'  TRUNCATED' if truncated else ''}")
+
+    if not collected:
+        rows, _ = _search(api, verbose, entity_types=["Release"])
+        absorb(rows)
+
+    if verbose:
+        print(f"  {len(collected)} unique release entities")
+        if truncated_regions:
+            print(f"  WARNING: results truncated at {SEARCH_CAP} for: "
+                  f"{', '.join(truncated_regions)}. Narrow --regions, or push a "
+                  f"filter server-side with --must-not-have-attr.")
+    return list(collected.values())
 
 
 def releases_on_day(releases: Iterable[Any], target: date, tz_offset_hours: float) -> List[Dict[str, Any]]:
@@ -273,7 +531,7 @@ def releases_on_day(releases: Iterable[Any], target: date, tz_offset_hours: floa
 
     hits: List[Dict[str, Any]] = []
     for ent in releases:
-        name = getattr(ent, "name", None)
+        name = _entity_name(ent)
         if not name:
             continue
         last = _as_datetime(_meta(ent, "LastReleaseEventTime"))
@@ -320,7 +578,7 @@ def series_for_release(api, release_name: str, regions: Optional[List[str]], lim
 
     scored: List[Tuple[float, str]] = []
     for ent in entities:
-        name = getattr(ent, "name", None)
+        name = _entity_name(ent)
         if not name:
             continue
         region = (_meta(ent, "Region") or "").lower()
@@ -368,34 +626,139 @@ def series_arrays(series: Any) -> Tuple[List[datetime], List[Optional[float]]]:
 # Probe mode
 # --------------------------------------------------------------------------
 
-def run_probe(api, regions: Optional[List[str]]) -> None:
+def list_regions(api) -> None:
+    """Print the region codes Macrobond actually uses, and reconcile with ours."""
+    print("\n=== Macrobond region codes ===")
+    try:
+        result = api.metadata_list_values("Region")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  metadata_list_values('Region') failed: {exc}")
+        return
+
+    found: Dict[str, str] = {}
+    for item in result:
+        code = _meta(item, "Value") or getattr(item, "value", None)
+        desc = _meta(item, "Description") or getattr(item, "description", "")
+        if code:
+            found[str(code).lower()] = str(desc)
+    print(f"  {len(found)} region values")
+    for code, desc in sorted(found.items()):
+        print(f"    {code:<8} {desc}")
+
+    ours = set(DEVELOPED + EM_MAJOR + AFRICA + FRONTIER + CORE_REGIONS)
+    unknown = sorted(c for c in ours if c not in found)
+    if unknown:
+        print(f"\n  WARNING: {len(unknown)} codes in this script are not valid "
+              f"Macrobond regions and will match nothing:")
+        print(f"    {', '.join(unknown)}")
+    else:
+        print("\n  every code in this script matches a Macrobond region.")
+
+    unmapped = sorted(c for c in found if c not in ours)
+    if unmapped:
+        print(f"\n  {len(unmapped)} Macrobond regions are in neither the include "
+              f"presets nor the exclusion lists:")
+        print(f"    {', '.join(unmapped)}")
+
+
+def run_probe(api, regions: Optional[List[str]], outdir: str = ".") -> None:
+    print("\n=== PROBE: raw shape of a search result ===")
+    raw, truncated = _search(api, True, entity_types=["Release"],
+                             must_have_values={"Region": (regions or ["us"])[0]})
+    print(f"  rows: {len(raw)}   truncated: {truncated}")
+    if raw:
+        first = raw[0]
+        print(f"  python type of a row: {type(first)}")
+        print(f"  is a Mapping: {isinstance(first, dict)}")
+        print(f"  has .name attribute: {hasattr(first, 'name')}")
+        print(f"  has .metadata attribute: {hasattr(first, 'metadata')}")
+
     print("\n=== PROBE: Release entities ===")
     releases = fetch_releases(api, regions)
-    print(f"total release entities returned: {len(releases)}")
+    print(f"total unique release entities: {len(releases)}")
     if not releases:
-        print("nothing came back. Check the Data+ licence and entity type name.")
+        print("nothing came back. Check the Data+ licence and the entity type name.")
         return
 
     keys: Dict[str, int] = {}
-    for ent in releases[:2000]:
-        md = getattr(ent, "metadata", {}) or {}
-        for k in md:
+    samples: Dict[str, Any] = {}
+    for ent in releases:
+        for k, v in _as_mapping(ent).items():
             keys[k] = keys.get(k, 0) + 1
-    print("\nmetadata attributes present on Release entities (attribute: count):")
+            samples.setdefault(k, v)
+    print(f"\nmetadata attributes present on Release entities "
+          f"(attribute: count of {len(releases)}, example value):")
     for k, v in sorted(keys.items(), key=lambda kv: -kv[1]):
-        print(f"  {k:<34} {v}")
+        print(f"  {k:<34} {v:>6}   {samples[k]!r}")
+
+    dated = [e for e in releases
+             if _as_datetime(_meta(e, "NextReleaseEventTime"))
+             or _as_datetime(_meta(e, "LastReleaseEventTime"))]
+    print(f"\nreleases carrying a parseable event time: {len(dated)} of {len(releases)}")
+
+    # Which attribute separates economic from company releases? Print the value
+    # distribution of every low-cardinality attribute and read it off.
+    print("\nvalue distribution of low-cardinality attributes "
+          "(candidate economic/company discriminators):")
+    for attr in sorted(keys):
+        values: Dict[str, int] = {}
+        for ent in releases:
+            raw = _meta(ent, attr)
+            if raw in (None, "", []):
+                continue
+            values[str(raw)] = values.get(str(raw), 0) + 1
+        if not values or len(values) > 25:
+            continue
+        print(f"  {attr}  ({len(values)} distinct)")
+        for v, n in sorted(values.items(), key=lambda kv: -kv[1]):
+            print(f"      {n:>6}  {v}")
+
+    print("\nclassification under the current heuristic:")
+    tally: Dict[str, int] = {}
+    reasons: Dict[str, int] = {}
+    for ent in releases:
+        k, reason = classify_release(ent)
+        tally[k] = tally.get(k, 0) + 1
+        reasons[f"{k}: {reason}"] = reasons.get(f"{k}: {reason}", 0) + 1
+    for k, n in sorted(tally.items(), key=lambda kv: -kv[1]):
+        print(f"  {k:<10} {n}")
+    print("  reasons:")
+    for r, n in sorted(reasons.items(), key=lambda kv: -kv[1])[:12]:
+        print(f"      {n:>6}  {r}")
+
+    print("\n10 releases classified as company (check these are genuinely corporate):")
+    for ent in [e for e in releases if classify_release(e)[0] == "company"][:10]:
+        print(f"    {_entity_name(ent)}  |  {_meta(ent, 'Description')}")
+    print("\n10 classified as unknown (these are kept when --kind economic):")
+    for ent in [e for e in releases if classify_release(e)[0] == "unknown"][:10]:
+        print(f"    {_entity_name(ent)}  |  {_meta(ent, 'Description')}")
 
     print("\nfirst 5 release entities in full:")
     for ent in releases[:5]:
-        print(f"\n  name: {getattr(ent, 'name', '?')}")
-        for k, v in (getattr(ent, "metadata", {}) or {}).items():
+        print(f"\n  name: {_entity_name(ent)}")
+        for k, v in _as_mapping(ent).items():
             print(f"    {k}: {v!r}")
 
-    sample = getattr(releases[0], "name", None)
+    dump = os.path.join(outdir, "macrobond_probe_releases.json")
+    try:
+        os.makedirs(outdir, exist_ok=True)
+        with open(dump, "w", encoding="utf-8") as fh:
+            json.dump([_as_mapping(e) for e in releases[:300]], fh, indent=2, default=str)
+        print(f"\nfirst 300 release metadata records written to {dump}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"\ncould not write the probe dump: {exc}")
+
+    sample = _entity_name(releases[0])
     if sample:
         print(f"\n=== PROBE: series attached to release {sample!r} ===")
-        names = series_for_release(api, sample, regions, 10)
-        print(f"  {len(names)} candidate series: {names}")
+        try:
+            rows, _ = _search(api, True, entity_types=["TimeSeries"],
+                              must_have_values={"Release": sample})
+            print(f"  {len(rows)} member series")
+            for row in rows[:5]:
+                print(f"    {_entity_name(row)}  |  {_meta(row, 'Description')}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  member lookup failed: {exc}")
 
 
 # --------------------------------------------------------------------------
@@ -404,18 +767,32 @@ def run_probe(api, regions: Optional[List[str]]) -> None:
 
 def run_scan(args) -> Dict[str, Any]:
     target = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else date.today()
-    regions = None if args.regions.lower() == "all" else [r.strip().lower() for r in args.regions.split(",") if r.strip()]
+    regions, excluded = resolve_regions(args.regions, args.exclude, args.keep_excluded)
 
     print(f"Macrobond release scan for {target.isoformat()}")
-    print(f"regions: {'all' if regions is None else ','.join(regions)}")
+    print(f"regions: {'all' if regions is None else ','.join(regions)}"
+          f"  ({len(regions) if regions else 'unbounded'})")
+    if excluded:
+        print(f"excluding {len(excluded)} regions (Africa ex-ZA and frontier by default)")
 
     with open_client(args.client) as api:
+        if args.list_regions:
+            list_regions(api)
+            return {}
         if args.probe:
-            run_probe(api, regions)
+            run_probe(api, regions, args.outdir)
             return {}
 
         print("\n[1/4] fetching release calendar")
-        releases = fetch_releases(api, regions)
+        releases = fetch_releases(
+            api, regions,
+            must_have=_parse_kv(args.must_have),
+            must_not_have=_parse_kv(args.must_not_have),
+            must_not_have_attributes=[a for a in args.must_not_have_attr.split(",") if a],
+        )
+        releases = drop_excluded_regions(releases, excluded)
+        releases = filter_releases_by_kind(releases, args.kind)
+        print(f"  {len(releases)} {args.kind} releases after filtering")
         todays = releases_on_day(releases, target, args.tz_offset)
         if args.status != "all":
             todays = [r for r in todays if r["status"].lower() == args.status.lower()]
@@ -704,6 +1081,89 @@ def run_selftest() -> int:
         FakeEnt("rel_c", {"Description": "C", "Region": "jp",
                           "LastReleaseEventTime": "2026-08-16T23:50:00Z"}),
     ]
+    # 9b. the shape entity_search actually returns: bare metadata mappings
+    dict_ents = [
+        {"Name": "rel_a", "Description": "A", "Region": "us",
+         "LastReleaseEventTime": "2026-08-17T12:30:00Z"},
+        {"Name": "rel_b", "Description": "B", "Region": "gb",
+         "NextReleaseEventTime": "2026-08-17T06:00:00Z"},
+        {"Name": "rel_z", "Description": "Z", "Region": "us",
+         "LastReleaseEventTime": "2026-08-11T12:30:00Z"},
+    ]
+    check("name read from a metadata mapping", _entity_name(dict_ents[0]) == "rel_a",
+          f"got {_entity_name(dict_ents[0])}")
+    check("metadata read from a mapping", _meta(dict_ents[0], "Region") == "us")
+    check("name falls back to the .name attribute",
+          _entity_name(FakeEnt("rel_obj", {"Description": "O"})) == "rel_obj")
+    dict_hits = releases_on_day(dict_ents, date(2026, 8, 17), 0.0)
+    check("mapping-shaped rows filter to the right day", len(dict_hits) == 2,
+          f"got {len(dict_hits)}")
+    check("mapping-shaped rows keep their description",
+          {h["description"] for h in dict_hits} == {"A", "B"})
+
+    # 9c. economic vs company classification
+    econ = {"Name": "rel_us_cpi", "Description": "Consumer Price Index",
+            "Region": "us", "Source": "BLS"}
+    corp_attr = {"Name": "rel_aapl", "Description": "Apple Inc",
+                 "Region": "us", "Company": "Apple Inc", "Isin": "US0378331005"}
+    corp_text = {"Name": "rel_x", "Description": "Q3 Earnings Release", "Region": "us"}
+    bare = {"Name": "rel_y", "Description": "Something"}
+
+    check("economic release classified economic", classify_release(econ)[0] == "economic",
+          f"got {classify_release(econ)}")
+    check("company attribute wins", classify_release(corp_attr)[0] == "company",
+          f"got {classify_release(corp_attr)}")
+    check("earnings wording caught", classify_release(corp_text)[0] == "company",
+          f"got {classify_release(corp_text)}")
+    check("no discriminator is unknown, not a false economic",
+          classify_release(bare)[0] == "unknown", f"got {classify_release(bare)}")
+    check("typed attribute beats wording",
+          classify_release({"Name": "r", "Description": "Earnings",
+                            "ReleaseType": "Economic"})[0] == "economic")
+
+    kept = filter_releases_by_kind([econ, corp_attr, corp_text, bare], "economic", verbose=False)
+    check("economic filter drops both company rows", len(kept) == 2, f"got {len(kept)}")
+    check("unknown is kept rather than silently dropped",
+          any(_entity_name(k) == "rel_y" for k in kept))
+    check("--kind all keeps everything",
+          len(filter_releases_by_kind([econ, corp_attr], "all", verbose=False)) == 2)
+
+    # 9d. region resolution
+    inc, exc = resolve_regions("core")
+    check("core preset resolves", inc == CORE_REGIONS, f"got {inc}")
+    inc, exc = resolve_regions("dm-em")
+    check("dm-em includes South Africa", "za" in inc)
+    check("dm-em excludes Nigeria", "ng" not in inc)
+    check("dm-em excludes Vietnam as frontier", "vn" not in inc)
+    check("Africa list does not contain za", "za" not in AFRICA)
+    check("no code is both included and excluded by default",
+          not (set(DEVELOPED + EM_MAJOR) & set(DEFAULT_EXCLUDED)),
+          f"overlap: {sorted(set(DEVELOPED + EM_MAJOR) & set(DEFAULT_EXCLUDED))}")
+
+    inc, exc = resolve_regions("all")
+    check("all preset has no include filter", inc is None)
+    check("all preset still excludes Kenya", "ke" in exc)
+
+    inc, exc = resolve_regions("us,ng")
+    check("explicit list is taken at face value", inc == ["us", "ng"], f"got {inc}")
+    check("explicit list clears that code from exclusions", "ng" not in exc)
+
+    inc, exc = resolve_regions("dm-em", extra_excludes="tr,mx")
+    check("extra excludes drop from the preset", "tr" not in inc and "mx" not in inc)
+
+    inc, exc = resolve_regions("all", keep_excluded=True)
+    check("--keep-excluded empties the exclusion set", exc == set())
+
+    rels = [{"Name": "a", "Region": "us"}, {"Name": "b", "Region": "ng"},
+            {"Name": "c", "Region": "za"}, {"Name": "d"}]
+    kept = drop_excluded_regions(rels, set(DEFAULT_EXCLUDED), verbose=False)
+    check("excluded region dropped", not any(_entity_name(k) == "b" for k in kept))
+    check("South Africa survives", any(_entity_name(k) == "c" for k in kept))
+    check("release with no region is kept", any(_entity_name(k) == "d" for k in kept))
+
+    check("kv parser handles pairs", _parse_kv("A=1,B=2") == {"A": "1", "B": "2"})
+    check("kv parser ignores junk", _parse_kv("nonsense,,C=3") == {"C": "3"})
+
     hits = releases_on_day(ents, date(2026, 8, 17), 0.0)
     check("two releases match the target day", len(hits) == 2, f"got {len(hits)}")
     check("released vs upcoming split correctly",
@@ -718,12 +1178,42 @@ def run_selftest() -> int:
 
 # --------------------------------------------------------------------------
 
+def _parse_kv(text: str) -> Dict[str, Any]:
+    """Parse 'Key=Value,Key2=Value2' into a dict for search filters."""
+    out: Dict[str, Any] = {}
+    for pair in (text or "").split(","):
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if k and v:
+                out[k] = v
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Macrobond release calendar scan")
     ap.add_argument("--date", help="YYYY-MM-DD, defaults to today")
-    ap.add_argument("--regions", default=",".join(CORE_REGIONS),
-                    help="comma separated Macrobond region codes, or 'all'")
+    ap.add_argument("--regions", default="dm-em",
+                    help="preset (core, dm, dm-em, all) or a comma separated list of "
+                         "region codes. An explicit list overrides the exclusions")
+    ap.add_argument("--exclude", default="",
+                    help="extra region codes to exclude, comma separated")
+    ap.add_argument("--keep-excluded", action="store_true",
+                    help="do not apply the default Africa and frontier exclusions")
+    ap.add_argument("--list-regions", action="store_true",
+                    help="print Macrobond's region codes, check this script's lists "
+                         "against them, and exit")
     ap.add_argument("--status", default="all", choices=["all", "released", "upcoming"])
+    ap.add_argument("--kind", default="economic", choices=["economic", "company", "all"],
+                    help="economic releases only by default, company earnings excluded")
+    ap.add_argument("--must-have", default="",
+                    help="extra search filter, 'Key=Value,Key2=Value2'")
+    ap.add_argument("--must-not-have", default="",
+                    help="exclude releases with these metadata values, 'Key=Value'")
+    ap.add_argument("--must-not-have-attr", default="",
+                    help="exclude releases carrying these attributes, comma separated, "
+                         "e.g. Company,Isin. Pushed server-side, so it also beats the "
+                         "2000-result cap")
     ap.add_argument("--client", default="com", choices=["com", "web"],
                     help="com = Macrobond desktop on Windows, web = Data Web API feed")
     ap.add_argument("--tz-offset", type=float, default=1.0,
