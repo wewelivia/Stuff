@@ -133,7 +133,7 @@ COMPANY_TEXT_PATTERNS = (
 MIN_OBS_FOR_SCORE = 24          # need this many trailing points to compute z
 TRAILING_WINDOW = 60            # observations used for mean/sd
 TREND_TEST_RATIO = 0.35         # |mean(diff)| > ratio * sd(diff) => trending
-DEFAULT_MAX_SERIES_PER_RELEASE = 25
+DEFAULT_MAX_SERIES_PER_RELEASE = 5
 DEFAULT_MAX_RELEASES = 400
 
 CACHE_FILENAME = "macrobond_release_cache.json"
@@ -432,6 +432,124 @@ def verdict(profile: Dict[str, Any]) -> str:
 
 
 # --------------------------------------------------------------------------
+# Cache
+# --------------------------------------------------------------------------
+
+class Cache:
+    """
+    On-disk JSON cache. Three separate stores with different lifetimes:
+
+      releases        the calendar itself, refreshed daily
+      release_members which series belong to a release, refreshed weekly since
+                      membership is near-static. This is the big saving: it
+                      removes one search per release per run.
+      series_modified the last-modified timestamp of each series, used to ask
+                      Macrobond for changes only.
+
+    Keep this on a local unsynced path. OneDrive corrupts files that are
+    rewritten frequently.
+    """
+
+    VERSION = 2
+
+    def __init__(self, path: str, enabled: bool = True) -> None:
+        self.path = path
+        self.enabled = enabled
+        self.data: Dict[str, Any] = {
+            "version": self.VERSION,
+            "releases": {},
+            "release_members": {},
+            "series_modified": {},
+        }
+        self.hits = {"calendar": 0, "members": 0}
+        if enabled:
+            self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if loaded.get("version") != self.VERSION:
+                print(f"  cache version changed, starting fresh ({self.path})")
+                return
+            self.data = loaded
+            for key in ("releases", "release_members", "series_modified"):
+                self.data.setdefault(key, {})
+        except Exception as exc:  # noqa: BLE001
+            print(f"  cache unreadable, starting fresh: {exc}")
+
+    def save(self) -> None:
+        if not self.enabled:
+            return
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.data, fh, default=str)
+            os.replace(tmp, self.path)      # atomic, survives an interrupted run
+        except Exception as exc:  # noqa: BLE001
+            print(f"  could not write the cache: {exc}")
+
+    @staticmethod
+    def _fresh(stamp: Optional[str], max_age: timedelta) -> bool:
+        if not stamp:
+            return False
+        when = _as_datetime(stamp)
+        if when is None:
+            return False
+        return datetime.now(timezone.utc) - when <= max_age
+
+    # -- calendar ----------------------------------------------------------
+    def get_calendar(self, key: str, ttl_hours: float) -> Optional[List[Any]]:
+        if not self.enabled:
+            return None
+        entry = self.data["releases"].get(key)
+        if entry and self._fresh(entry.get("fetched"), timedelta(hours=ttl_hours)):
+            self.hits["calendar"] += 1
+            return entry.get("rows", [])
+        return None
+
+    def put_calendar(self, key: str, rows: List[Any]) -> None:
+        if not self.enabled:
+            return
+        self.data["releases"][key] = {
+            "fetched": datetime.now(timezone.utc).isoformat(),
+            "rows": [_as_mapping(r) for r in rows],
+        }
+
+    # -- release membership ------------------------------------------------
+    def get_members(self, release: str, ttl_days: float) -> Optional[List[str]]:
+        if not self.enabled:
+            return None
+        entry = self.data["release_members"].get(release)
+        if entry and self._fresh(entry.get("fetched"), timedelta(days=ttl_days)):
+            self.hits["members"] += 1
+            return entry.get("series", [])
+        return None
+
+    def put_members(self, release: str, series: List[str]) -> None:
+        if not self.enabled:
+            return
+        self.data["release_members"][release] = {
+            "fetched": datetime.now(timezone.utc).isoformat(),
+            "series": series,
+        }
+
+    # -- series last-modified ---------------------------------------------
+    def get_modified(self, name: str) -> Optional[datetime]:
+        if not self.enabled:
+            return None
+        return _as_datetime(self.data["series_modified"].get(name))
+
+    def put_modified(self, name: str, when: Optional[datetime]) -> None:
+        if not self.enabled:
+            return
+        self.data["series_modified"][name] = (when or datetime.now(timezone.utc)).isoformat()
+
+
+# --------------------------------------------------------------------------
 # Macrobond access
 # --------------------------------------------------------------------------
 
@@ -443,9 +561,10 @@ def open_client(mode: str):
     return WebClient()
 
 
-SEARCH_CAP = 2000   # Macrobond truncates entity_search at this many results
-
-
+# Macrobond returns "up to ~6000 entities in the search result" and guarantees
+# "at least 2000 entities before the result is truncated". The exact ceiling is
+# therefore not a number we can rely on, so we trust is_truncated and never
+# infer truncation from the row count.
 def _search(api, verbose: bool, **kwargs) -> Tuple[List[Any], bool]:
     """Run one entity_search. Returns (rows, was_truncated)."""
     try:
@@ -455,7 +574,7 @@ def _search(api, verbose: bool, **kwargs) -> Tuple[List[Any], bool]:
             print(f"    search failed ({kwargs}): {exc}")
         return [], False
     rows = list(result)
-    truncated = bool(getattr(result, "is_truncated", False)) or len(rows) >= SEARCH_CAP
+    truncated = bool(getattr(result, "is_truncated", False))
     return rows, truncated
 
 
@@ -517,7 +636,7 @@ def fetch_releases(api, regions: Optional[List[str]], verbose: bool = True,
     if verbose:
         print(f"  {len(collected)} unique release entities")
         if truncated_regions:
-            print(f"  WARNING: results truncated at {SEARCH_CAP} for: "
+            print(f"  WARNING: Macrobond reported a truncated result for: "
                   f"{', '.join(truncated_regions)}. Narrow --regions, or push a "
                   f"filter server-side with --must-not-have-attr.")
     return list(collected.values())
@@ -561,8 +680,21 @@ def releases_on_day(releases: Iterable[Any], target: date, tz_offset_hours: floa
     return hits
 
 
-def series_for_release(api, release_name: str, regions: Optional[List[str]], limit: int) -> List[str]:
-    """Names of time series that belong to a release, headline candidates first."""
+def series_for_release(api, release_name: str, regions: Optional[List[str]], limit: int,
+                       cache: Optional["Cache"] = None,
+                       ttl_days: float = 7.0) -> List[str]:
+    """
+    Names of time series that belong to a release, headline candidates first.
+
+    Cached, because release membership changes on the timescale of Macrobond
+    adding a new series, not daily. This is the single biggest saving: without
+    it we fire one search per release on every run.
+    """
+    if cache is not None:
+        cached = cache.get_members(release_name, ttl_days)
+        if cached is not None:
+            return cached[:limit]
+
     from macrobond_data_api.common.types import SearchFilter  # type: ignore
 
     entities: List[Any] = []
@@ -593,21 +725,66 @@ def series_for_release(api, release_name: str, regions: Optional[List[str]], lim
         scored.append((rank, name))
 
     scored.sort()
-    return [n for _, n in scored[:limit]]
+    ranked = [n for _, n in scored]
+    if cache is not None:
+        # cache the full ranked list so raising --max-series-per-release later
+        # does not force a re-search
+        cache.put_members(release_name, ranked[:200])
+    return ranked[:limit]
 
 
-def load_series_batch(api, names: Sequence[str]) -> Dict[str, Any]:
+def load_series_batch(api, names: Sequence[str], cache: Optional["Cache"] = None,
+                      incremental: bool = True) -> Tuple[Dict[str, Any], int]:
+    """
+    Download series, asking Macrobond only for what has changed.
+
+    get_many_series accepts (name, last_modified) tuples. With
+    include_not_modified=False, anything unchanged since the timestamp we hold
+    is omitted from the response and no data crosses the wire. A series that
+    comes back NotModified has no new print, so there is nothing to score and
+    dropping it is correct, not a compromise.
+
+    Returns (series by name, count skipped as unchanged).
+    """
     out: Dict[str, Any] = {}
+    use_incremental = incremental and cache is not None and cache.enabled
+
     for i in range(0, len(names), 150):
         chunk = list(names[i:i + 150])
-        try:
-            for s in api.get_series(chunk, raise_error=False):
-                if getattr(s, "is_error", False):
-                    continue
-                out[getattr(s, "name", "")] = s
-        except Exception as exc:  # noqa: BLE001
-            print(f"  series batch failed ({len(chunk)} names): {exc}")
-    return out
+        fetched = False
+
+        if use_incremental:
+            requests: List[Any] = []
+            for name in chunk:
+                stamp = cache.get_modified(name)
+                requests.append((name, stamp) if stamp else name)
+            try:
+                for s in api.get_many_series(requests, include_not_modified=False):
+                    if s is None or getattr(s, "is_error", False):
+                        continue
+                    name = _entity_name(s) or getattr(s, "name", "")
+                    if name:
+                        out[name] = s
+                fetched = True
+            except Exception as exc:  # noqa: BLE001
+                print(f"  incremental fetch unavailable, falling back: {exc}")
+
+        if not fetched:
+            try:
+                for s in api.get_series(chunk, raise_error=False):
+                    if getattr(s, "is_error", False):
+                        continue
+                    name = _entity_name(s) or getattr(s, "name", "")
+                    if name:
+                        out[name] = s
+            except Exception as exc:  # noqa: BLE001
+                print(f"  series batch failed ({len(chunk)} names): {exc}")
+
+    if cache is not None:
+        for name, s in out.items():
+            cache.put_modified(name, getattr(s, "last_modified", None))
+
+    return out, len(names) - len(out)
 
 
 def series_arrays(series: Any) -> Tuple[List[datetime], List[Optional[float]]]:
@@ -775,6 +952,14 @@ def run_scan(args) -> Dict[str, Any]:
     if excluded:
         print(f"excluding {len(excluded)} regions (Africa ex-ZA and frontier by default)")
 
+    cache = Cache(args.cache, enabled=not args.no_cache)
+    if args.refresh_cache:
+        cache.data["releases"] = {}
+        cache.data["release_members"] = {}
+        print("cache: calendar and membership cleared, timestamps kept")
+
+    searches = 0
+
     with open_client(args.client) as api:
         if args.list_regions:
             list_regions(api)
@@ -784,42 +969,79 @@ def run_scan(args) -> Dict[str, Any]:
             return {}
 
         print("\n[1/4] fetching release calendar")
-        releases = fetch_releases(
-            api, regions,
-            must_have=_parse_kv(args.must_have),
-            must_not_have=_parse_kv(args.must_not_have),
-            must_not_have_attributes=[a for a in args.must_not_have_attr.split(",") if a],
-        )
-        releases = drop_excluded_regions(releases, excluded)
-        releases = filter_releases_by_kind(releases, args.kind)
+        cache_key = f"{args.regions}|{args.exclude}|{args.kind}|{args.must_have}|{args.must_not_have}"
+        releases = cache.get_calendar(cache_key, args.calendar_ttl_hours)
+        if releases is None:
+            releases = fetch_releases(
+                api, regions,
+                must_have=_parse_kv(args.must_have),
+                must_not_have=_parse_kv(args.must_not_have),
+                must_not_have_attributes=[a for a in args.must_not_have_attr.split(",") if a],
+            )
+            searches += len(regions) if regions else 1
+            releases = drop_excluded_regions(releases, excluded)
+            releases = filter_releases_by_kind(releases, args.kind)
+            cache.put_calendar(cache_key, releases)
+        else:
+            print(f"  from cache, under {args.calendar_ttl_hours}h old")
         print(f"  {len(releases)} {args.kind} releases after filtering")
+
         todays = releases_on_day(releases, target, args.tz_offset)
-        if args.status != "all":
-            todays = [r for r in todays if r["status"].lower() == args.status.lower()]
         todays = todays[:args.max_releases]
-        print(f"  {len(todays)} releases on {target.isoformat()}")
-        if not todays:
-            print("  nothing scheduled. Try --status all, a different date, or --regions all.")
-            return {"date": target.isoformat(), "releases": [], "rows": []}
+        released = [r for r in todays if r["status"] == "Released"]
+        upcoming = [r for r in todays if r["status"] != "Released"]
+        print(f"  {len(todays)} releases on {target.isoformat()} "
+              f"({len(released)} released, {len(upcoming)} upcoming)")
+
+        # Only Released entries have a new print. Fetching series for Upcoming
+        # ones downloads data we already scored on a previous run.
+        if args.status == "all":
+            to_score = todays
+        elif args.status == "upcoming":
+            to_score = upcoming
+        else:
+            to_score = released
+        if upcoming and args.status == "released":
+            print(f"  skipping {len(upcoming)} upcoming releases, no new print to score")
+
+        if not to_score:
+            print("  nothing to score. The calendar is still written to the report.")
+            out = {"date": target.isoformat(),
+                   "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                   "regions": "all" if regions is None else ",".join(regions),
+                   "releases": todays, "rows": []}
+            cache.save()
+            write_outputs(out, args.outdir, args.top)
+            return out
 
         print("\n[2/4] resolving member series")
         release_series: Dict[str, List[str]] = {}
         all_names: List[str] = []
-        for rel in todays:
-            names = series_for_release(api, rel["release"], regions, args.max_series_per_release)
+        for rel in to_score:
+            before = cache.hits["members"]
+            names = series_for_release(api, rel["release"], regions,
+                                       args.max_series_per_release, cache,
+                                       args.members_ttl_days)
+            if cache.hits["members"] == before:
+                searches += 1
             release_series[rel["release"]] = names
             all_names.extend(names)
-            print(f"  {rel['release']:<40} {len(names):>4} series")
         all_names = list(dict.fromkeys(all_names))
+        print(f"  {cache.hits['members']} of {len(to_score)} releases from cache, "
+              f"{searches} searches this run")
         print(f"  {len(all_names)} unique series to fetch")
 
         print("\n[3/4] downloading observations")
-        loaded = load_series_batch(api, all_names)
-        print(f"  {len(loaded)} series returned")
+        loaded, unchanged = load_series_batch(api, all_names, cache,
+                                              incremental=not args.full_download)
+        print(f"  {len(loaded)} series with new or revised data, "
+              f"{unchanged} unchanged and not transferred")
+
+    cache.save()
 
     print("\n[4/4] scoring")
     rows: List[Dict[str, Any]] = []
-    for rel in todays:
+    for rel in to_score:
         for name in release_series.get(rel["release"], []):
             s = loaded.get(name)
             if s is None:
@@ -1161,6 +1383,104 @@ def run_selftest() -> int:
     check("South Africa survives", any(_entity_name(k) == "c" for k in kept))
     check("release with no region is kept", any(_entity_name(k) == "d" for k in kept))
 
+    # 9e. cache behaviour
+    import tempfile
+    tmpdir = tempfile.mkdtemp()
+    cpath = os.path.join(tmpdir, "cache.json")
+
+    c = Cache(cpath, enabled=True)
+    check("empty cache misses the calendar", c.get_calendar("k", 12) is None)
+    c.put_calendar("k", [{"Name": "rel_a", "Region": "us"}])
+    c.save()
+    c2 = Cache(cpath, enabled=True)
+    check("calendar survives a reload", c2.get_calendar("k", 12) is not None)
+    check("calendar cache counts a hit", c2.hits["calendar"] == 1)
+    check("expired calendar is a miss", c2.get_calendar("k", 0) is None)
+    check("different filter key is a miss", c2.get_calendar("other", 12) is None)
+
+    c2.put_members("rel_a", ["s1", "s2", "s3"])
+    check("membership returns and respects the limit",
+          Cache.__dict__ and c2.get_members("rel_a", 7)[:2] == ["s1", "s2"])
+    check("expired membership is a miss", c2.get_members("rel_a", 0) is None)
+
+    c2.put_modified("s1", datetime(2026, 8, 17, tzinfo=timezone.utc))
+    c2.save()
+    c3 = Cache(cpath, enabled=True)
+    check("last-modified survives a reload",
+          c3.get_modified("s1") == datetime(2026, 8, 17, tzinfo=timezone.utc))
+    check("unknown series has no timestamp", c3.get_modified("nope") is None)
+
+    disabled = Cache(cpath, enabled=False)
+    check("disabled cache never hits", disabled.get_calendar("k", 12) is None
+          and disabled.get_members("rel_a", 7) is None
+          and disabled.get_modified("s1") is None)
+
+    # a corrupt cache must not take the run down
+    with open(cpath, "w", encoding="utf-8") as fh:
+        fh.write("{ this is not json")
+    c4 = Cache(cpath, enabled=True)
+    check("corrupt cache falls back to empty", c4.get_calendar("k", 12) is None)
+
+    # 9f. incremental download against a fake API
+    class FakeSeries:
+        def __init__(self, name, n=40):
+            self.name = name
+            self.metadata = {"Name": name, "Description": name}
+            self.is_error = False
+            self.last_modified = datetime(2026, 8, 17, tzinfo=timezone.utc)
+            self.dates = [base + timedelta(days=30 * i) for i in range(n)]
+            self.values = [50 + random.gauss(0, 1) for _ in range(n)]
+
+    class FakeApi:
+        def __init__(self, changed):
+            self.changed = set(changed)
+            self.many_calls = 0
+            self.plain_calls = 0
+            self.last_request = None
+
+        def get_many_series(self, requests, include_not_modified=False):
+            self.many_calls += 1
+            self.last_request = list(requests)
+            for req in requests:
+                name = req[0] if isinstance(req, tuple) else req
+                stamp = req[1] if isinstance(req, tuple) else None
+                if stamp is not None and name not in self.changed:
+                    continue          # NotModified, omitted from the response
+                yield FakeSeries(name)
+
+        def get_series(self, names, raise_error=False):
+            self.plain_calls += 1
+            return [FakeSeries(n) for n in names]
+
+    fresh = Cache(os.path.join(tmpdir, "c2.json"), enabled=True)
+    api = FakeApi(changed=[])
+    loaded, unchanged = load_series_batch(api, ["s1", "s2", "s3"], fresh)
+    check("first run downloads everything", len(loaded) == 3 and unchanged == 0,
+          f"got {len(loaded)}, {unchanged}")
+    check("first run sends bare names, no timestamps",
+          all(not isinstance(r, tuple) for r in api.last_request))
+
+    api2 = FakeApi(changed=["s2"])
+    loaded, unchanged = load_series_batch(api2, ["s1", "s2", "s3"], fresh)
+    check("second run sends timestamps",
+          all(isinstance(r, tuple) for r in api2.last_request))
+    check("only the changed series comes back", list(loaded) == ["s2"], f"got {list(loaded)}")
+    check("unchanged series are counted, not transferred", unchanged == 2, f"got {unchanged}")
+
+    api3 = FakeApi(changed=["s2"])
+    loaded, _ = load_series_batch(api3, ["s1", "s2", "s3"], fresh, incremental=False)
+    check("--full-download bypasses the incremental path",
+          api3.plain_calls == 1 and api3.many_calls == 0 and len(loaded) == 3)
+
+    class BrokenApi(FakeApi):
+        def get_many_series(self, requests, include_not_modified=False):
+            raise RuntimeError("not supported on this client")
+
+    broken = BrokenApi(changed=[])
+    loaded, _ = load_series_batch(broken, ["s1", "s2"], fresh)
+    check("incremental failure falls back to get_series",
+          broken.plain_calls == 1 and len(loaded) == 2)
+
     check("kv parser handles pairs", _parse_kv("A=1,B=2") == {"A": "1", "B": "2"})
     check("kv parser ignores junk", _parse_kv("nonsense,,C=3") == {"C": "3"})
 
@@ -1203,7 +1523,21 @@ def main() -> int:
     ap.add_argument("--list-regions", action="store_true",
                     help="print Macrobond's region codes, check this script's lists "
                          "against them, and exit")
-    ap.add_argument("--status", default="all", choices=["all", "released", "upcoming"])
+    ap.add_argument("--status", default="released", choices=["all", "released", "upcoming"],
+                    help="which releases to SCORE. The calendar table always shows "
+                         "everything on the day. Upcoming releases have no new print, "
+                         "so scoring them just re-downloads old data")
+    ap.add_argument("--cache", default="macrobond_scan_cache.json",
+                    help="cache file path. Keep it on a local unsynced path, "
+                         "OneDrive corrupts frequently rewritten files")
+    ap.add_argument("--no-cache", action="store_true", help="bypass the cache entirely")
+    ap.add_argument("--refresh-cache", action="store_true",
+                    help="discard the cached calendar and membership, keep timestamps")
+    ap.add_argument("--calendar-ttl-hours", type=float, default=12.0)
+    ap.add_argument("--members-ttl-days", type=float, default=7.0,
+                    help="how long to trust cached release membership")
+    ap.add_argument("--full-download", action="store_true",
+                    help="disable the NotModified path and re-download everything")
     ap.add_argument("--kind", default="economic", choices=["economic", "company", "all"],
                     help="economic releases only by default, company earnings excluded")
     ap.add_argument("--must-have", default="",
@@ -1219,7 +1553,9 @@ def main() -> int:
     ap.add_argument("--tz-offset", type=float, default=1.0,
                     help="hours to add to UTC for display, 1.0 = BST")
     ap.add_argument("--max-releases", type=int, default=DEFAULT_MAX_RELEASES)
-    ap.add_argument("--max-series-per-release", type=int, default=DEFAULT_MAX_SERIES_PER_RELEASE)
+    ap.add_argument("--max-series-per-release", type=int, default=DEFAULT_MAX_SERIES_PER_RELEASE,
+                    help="headline aggregates only by default. Raising this pulls in "
+                         "the component tail and multiplies the download")
     ap.add_argument("--top", type=int, default=25, help="rows in the highlights table")
     ap.add_argument("--outdir", default=".", help="where to write CSV/JSON/HTML")
     ap.add_argument("--probe", action="store_true",
