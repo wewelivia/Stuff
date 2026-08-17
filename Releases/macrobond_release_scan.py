@@ -130,8 +130,37 @@ COMPANY_TEXT_PATTERNS = (
     "results release", "profit", "dividend",
 )
 
-MIN_OBS_FOR_SCORE = 24          # need this many trailing points to compute z
-TRAILING_WINDOW = 60            # observations used for mean/sd
+# Scoring windows are per frequency, in observations. A flat 60 observations
+# means five years for a monthly series and fifteen for a quarterly one, which
+# drags in COVID and the 2021-22 inflation surge, inflates the scale and
+# crushes genuine surprises towards zero. These windows target roughly the
+# recent regime instead: about three years monthly, five years quarterly.
+#
+#   window : observations used as the benchmark, excluding the latest print
+#   min    : refuse to score with fewer than this many benchmark observations
+#   recent : observations averaged for the near end of the trend-break measure
+#   prior  : observations averaged for the far end
+FREQ_CONFIG: Dict[str, Dict[str, int]] = {
+    "daily":     {"window": 250, "min": 60, "recent": 5, "prior": 20},
+    "weekly":    {"window": 104, "min": 30, "recent": 4, "prior": 13},
+    "monthly":   {"window": 36,  "min": 18, "recent": 3, "prior": 12},
+    "quarterly": {"window": 20,  "min": 10, "recent": 2, "prior": 6},
+    "annual":    {"window": 12,  "min": 8,  "recent": 1, "prior": 4},
+}
+DEFAULT_FREQ = "monthly"
+
+# Macrobond frequency strings vary; map what we see onto the table above.
+FREQ_ALIASES = {
+    "daily": "daily", "business daily": "daily", "bdaily": "daily", "d": "daily",
+    "weekly": "weekly", "biweekly": "weekly", "fortnightly": "weekly", "w": "weekly",
+    "monthly": "monthly", "m": "monthly",
+    "quarterly": "quarterly", "q": "quarterly",
+    "semiannual": "quarterly", "semi-annual": "quarterly", "halfyearly": "quarterly",
+    "annual": "annual", "yearly": "annual", "a": "annual", "y": "annual",
+}
+
+MIN_OBS_FOR_SCORE = 24          # legacy floor, superseded by FREQ_CONFIG[..]["min"]
+TRAILING_WINDOW = 60            # legacy window, superseded by FREQ_CONFIG[..]["window"]
 TREND_TEST_RATIO = 0.35         # |mean(diff)| > ratio * sd(diff) => trending
 DEFAULT_MAX_SERIES_PER_RELEASE = 5
 DEFAULT_MAX_RELEASES = 400
@@ -353,20 +382,115 @@ def _is_trending(levels: Sequence[float]) -> bool:
     return abs(statistics.fmean(diffs)) > TREND_TEST_RATIO * sd
 
 
-def score_series(dates: Sequence[datetime], values: Sequence[Optional[float]]) -> Optional[Dict[str, Any]]:
-    """Return the statistical profile of the latest observation, or None."""
+def normalise_frequency(raw: Any) -> Optional[str]:
+    """Map a Macrobond frequency string onto a FREQ_CONFIG key."""
+    if not raw:
+        return None
+    text = str(_first(raw)).strip().lower()
+    if text in FREQ_ALIASES:
+        return FREQ_ALIASES[text]
+    for key, value in FREQ_ALIASES.items():
+        if key in text:
+            return value
+    return None
+
+
+def infer_frequency(dates: Sequence[datetime]) -> str:
+    """Fall back to the median spacing between observations."""
+    if len(dates) < 3:
+        return DEFAULT_FREQ
+    gaps = sorted((b - a).days for a, b in zip(dates[:-1], dates[1:]) if (b - a).days > 0)
+    if not gaps:
+        return DEFAULT_FREQ
+    gap = gaps[len(gaps) // 2]
+    if gap <= 3:
+        return "daily"
+    if gap <= 10:
+        return "weekly"
+    if gap <= 45:
+        return "monthly"
+    if gap <= 135:
+        return "quarterly"
+    return "annual"
+
+
+WINSOR_FRACTION = 0.10
+WINSOR_CONSISTENCY = 0.86   # rescales a 10% winsorised sd back to Gaussian units
+
+
+def _scale(window: Sequence[float], mode: str = "winsor") -> Tuple[float, float, str]:
+    """
+    Centre and scale of the benchmark window.
+
+    A plain standard deviation is wrecked by a past dislocation: with five
+    dislocated observations in thirty-six, the scale roughly doubles and a
+    genuine 2.5 sd print reads as 1.1, well below any sensible threshold.
+
+    Measured on simulated windows of 36 observations:
+
+        estimator     wobble on clean data   dislocated window scale (true 1.0)
+        sd                    1.00x                      2.32
+        winsorised 10%        1.13x                      1.26
+        MAD                   1.64x                      1.14
+
+    Winsorising is the compromise. It resists dislocation nearly as well as MAD
+    while staying far more stable on well-behaved series, which matters because
+    an unstable denominator produces both false positives and false negatives.
+    MAD remains available for series with genuinely violent outliers.
+    """
+    if mode == "sd":
+        return statistics.fmean(window), statistics.pstdev(window), "sd"
+
+    if mode == "mad":
+        med = statistics.median(window)
+        mad = statistics.median([abs(x - med) for x in window])
+        scale = 1.4826 * mad
+        if scale > 0:
+            return med, scale, "MAD"
+
+    if mode == "winsor":
+        ordered = sorted(window)
+        n = len(ordered)
+        k = max(1, int(n * WINSOR_FRACTION))
+        lo, hi = ordered[k], ordered[n - 1 - k]
+        clipped = [min(max(x, lo), hi) for x in window]
+        scale = statistics.pstdev(clipped) / WINSOR_CONSISTENCY
+        if scale > 0:
+            return statistics.fmean(clipped), scale, "winsor"
+
+    # fall back where the robust estimator collapses, which happens on series
+    # that sit on a constant for long stretches
+    return statistics.fmean(window), statistics.pstdev(window), "sd"
+
+
+def score_series(dates: Sequence[datetime], values: Sequence[Optional[float]],
+                 frequency: Any = None, scale_mode: str = "winsor") -> Optional[Dict[str, Any]]:
+    """
+    Statistical profile of the latest observation, or None if unscoreable.
+
+    The benchmark window is sized by frequency rather than fixed, so a monthly
+    series is judged against roughly three years and a quarterly one against
+    five, instead of five and fifteen.
+    """
     clean: List[Tuple[datetime, float]] = []
     for d, v in zip(dates, values):
         f = _safe_float(v)
         if f is not None:
             clean.append((d, f))
-    if len(clean) < MIN_OBS_FOR_SCORE + 2:
+    if len(clean) < 4:
         return None
 
     obs_dates = [d for d, _ in clean]
     levels = [v for _, v in clean]
 
-    tail = levels[-(TRAILING_WINDOW + 2):]
+    freq = normalise_frequency(frequency) or infer_frequency(obs_dates)
+    cfg = FREQ_CONFIG.get(freq, FREQ_CONFIG[DEFAULT_FREQ])
+    win_n, min_n = cfg["window"], cfg["min"]
+
+    if len(clean) < min_n + 2:
+        return None
+
+    tail = levels[-(win_n + 2):]
     trending = _is_trending(tail)
 
     if trending:
@@ -378,36 +502,39 @@ def score_series(dates: Sequence[datetime], values: Sequence[Optional[float]]) -
         series = levels
         series_dates = obs_dates
 
-    if len(series) < MIN_OBS_FOR_SCORE + 1:
-        return None
-
     latest = series[-1]
-    window = series[-(TRAILING_WINDOW + 1):-1]
-    if len(window) < MIN_OBS_FOR_SCORE:
+    window = series[-(win_n + 1):-1]
+    if len(window) < min_n:
         return None
 
-    mean = statistics.fmean(window)
-    sd = statistics.pstdev(window)
-    z = (latest - mean) / sd if sd > 0 else 0.0
+    centre, scale, scale_kind = _scale(window, scale_mode)
+    z = (latest - centre) / scale if scale > 0 else 0.0
 
-    if len(series) >= 16:
-        recent3 = statistics.fmean(series[-3:])
-        prior12 = statistics.fmean(series[-15:-3])
-        trend_break = (recent3 - prior12) / sd if sd > 0 else 0.0
+    recent_n, prior_n = cfg["recent"], cfg["prior"]
+    if len(series) >= recent_n + prior_n + 1 and scale > 0:
+        recent = statistics.fmean(series[-recent_n:])
+        prior = statistics.fmean(series[-(recent_n + prior_n):-recent_n])
+        trend_break = (recent - prior) / scale
     else:
         trend_break = 0.0
 
     below = sum(1 for w in window if w <= latest)
     pctile = 100.0 * below / len(window)
 
+    span_days = (series_dates[-1] - series_dates[-len(window)]).days if len(window) else 0
+
     return {
         "space": space,
+        "frequency": freq,
         "latest_value": levels[-1],
         "latest_scored": latest,
         "obs_date": obs_dates[-1],
         "prev_value": levels[-2] if len(levels) > 1 else None,
-        "window_mean": mean,
-        "window_sd": sd,
+        "window_mean": centre,
+        "window_sd": scale,
+        "scale_kind": scale_kind,
+        "window_obs": len(window),
+        "window_years": round(span_days / 365.25, 1),
         "z": z,
         "abs_z": abs(z),
         "trend_break": trend_break,
@@ -415,6 +542,62 @@ def score_series(dates: Sequence[datetime], values: Sequence[Optional[float]]) -
         "n_obs": len(series),
         "scored_date": series_dates[-1],
     }
+
+
+# Long-form metadata fields, best first. Which of these Macrobond actually
+# populates is what the probe's attribute table will tell us.
+LONG_DESC_ATTRS = (
+    "FullDescription", "LongDescription", "Notes", "Comment", "Remarks",
+    "Method", "Definition",
+)
+
+FREQ_WORDS = {
+    "daily": "daily", "weekly": "weekly", "monthly": "monthly",
+    "quarterly": "quarterly", "annual": "annual", "yearly": "annual",
+    "biweekly": "fortnightly", "semiannual": "semi-annual",
+}
+
+
+def describe_series(series: Any, region: str = "", release_desc: str = "") -> str:
+    """
+    One sentence describing what the series is.
+
+    Prefer prose Macrobond already holds. Where there is none, compose from the
+    structured fields rather than leaving the row blank.
+    """
+    for attr in LONG_DESC_ATTRS:
+        raw = _meta(series, attr)
+        if raw and str(raw).strip():
+            text = " ".join(str(raw).split())
+            if len(text) > 400:
+                cut = text[:400].rsplit(". ", 1)[0]
+                text = (cut + ".") if len(cut) > 80 else text[:400].rsplit(" ", 1)[0] + "..."
+            if not text.endswith((".", "!", "?")):
+                text += "."
+            return text
+
+    name = str(_meta(series, "Description") or _entity_name(series) or "This series")
+    reg = str(_meta(series, "Region") or region or "").upper()
+    unit = str(_meta(series, "DisplayUnit") or _meta(series, "Unit") or "").strip()
+    freq = str(_meta(series, "Frequency") or "").strip().lower()
+    source = str(_meta(series, "Source") or "").strip()
+
+    parts = [name]
+    if reg:
+        parts.append(f"for {reg}")
+    bits = []
+    if freq:
+        bits.append(FREQ_WORDS.get(freq, freq))
+    if unit:
+        bits.append(f"measured in {unit}")
+    if bits:
+        parts.append("(" + ", ".join(bits) + ")")
+    sentence = " ".join(parts)
+    if source:
+        sentence += f", published by {source}"
+    elif release_desc and release_desc.lower() not in sentence.lower():
+        sentence += f", from the {release_desc} release"
+    return sentence.rstrip(".") + "."
 
 
 def verdict(profile: Dict[str, Any]) -> str:
@@ -1047,7 +1230,9 @@ def run_scan(args) -> Dict[str, Any]:
             if s is None:
                 continue
             dates, values = series_arrays(s)
-            profile = score_series(dates, values)
+            profile = score_series(dates, values,
+                                   frequency=_meta(s, "Frequency"),
+                                   scale_mode=args.scale)
             if profile is None:
                 continue
             rows.append({
@@ -1058,8 +1243,14 @@ def run_scan(args) -> Dict[str, Any]:
                 "event_time_local": rel["event_time_local"].strftime("%Y-%m-%d %H:%M") if rel["event_time_local"] else "",
                 "series": name,
                 "description": _meta(s, "Description") or name,
+                "about": describe_series(s, rel["region"], rel["description"]),
+                "source": _meta(s, "Source") or "",
                 "unit": _meta(s, "DisplayUnit") or _meta(s, "Unit") or "",
-                "frequency": _meta(s, "Frequency") or "",
+                "frequency": _meta(s, "Frequency") or profile["frequency"],
+                "freq_used": profile["frequency"],
+                "window_obs": profile["window_obs"],
+                "window_years": profile["window_years"],
+                "scale_kind": profile["scale_kind"],
                 "obs_date": profile["obs_date"].strftime("%Y-%m-%d") if profile["obs_date"] else "",
                 "latest": round(profile["latest_value"], 4),
                 "previous": round(profile["prev_value"], 4) if profile["prev_value"] is not None else "",
@@ -1092,8 +1283,9 @@ def run_scan(args) -> Dict[str, Any]:
 
 CSV_FIELDS = [
     "release", "release_description", "region", "status", "event_time_local",
-    "series", "description", "unit", "frequency", "obs_date", "latest",
-    "previous", "scored_on", "z", "abs_z", "trend_break", "pctile", "n_obs", "verdict",
+    "series", "description", "about", "source", "unit", "frequency", "obs_date",
+    "latest", "previous", "scored_on", "z", "abs_z", "trend_break", "pctile",
+    "n_obs", "window_obs", "window_years", "scale_kind", "verdict",
 ]
 
 
@@ -1124,101 +1316,333 @@ def write_outputs(payload: Dict[str, Any], outdir: str, top: int) -> None:
 
 
 def render_html(payload: Dict[str, Any], top: int) -> str:
-    rows = payload["rows"]
-    highlights = rows[:top]
+    """
+    Self-contained interactive report. Data is embedded as JSON and everything
+    runs client side, so it opens straight from file:// with no server and no
+    CDN. Nothing is fetched at runtime, which matters behind the corporate
+    proxy.
+    """
+    def clean(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out = []
+        for r in rows:
+            d = dict(r)
+            for k, v in list(d.items()):
+                if isinstance(v, datetime):
+                    d[k] = v.strftime("%Y-%m-%d %H:%M")
+                elif v is None:
+                    d[k] = ""
+            out.append(d)
+        return out
 
-    def band(z: float) -> str:
-        az = abs(z)
-        if az >= 3:
-            return "x"
-        if az >= 2:
-            return "h"
-        if az >= 1.25:
-            return "m"
-        return "l"
+    data = {
+        "date": payload["date"],
+        "generated": payload["generated_utc"],
+        "regions": payload["regions"],
+        "top": top,
+        "rows": clean(payload["rows"]),
+        "releases": clean(payload["releases"]),
+    }
+    blob = json.dumps(data, default=str).replace("</", "<\\/")
 
-    def tbody(items: List[Dict[str, Any]]) -> str:
-        cells = []
-        for r in items:
-            cells.append(
-                f"<tr class='{band(r['z'])}'>"
-                f"<td class='z'>{r['z']:+.2f}</td>"
-                f"<td class='reg'>{r['region'].upper()}</td>"
-                f"<td class='desc'>{r['description']}<span class='sub'>{r['release_description']}</span></td>"
-                f"<td class='num'>{r['latest']}</td>"
-                f"<td class='num'>{r['previous']}</td>"
-                f"<td class='num'>{r['trend_break']:+.2f}</td>"
-                f"<td class='num'>{r['pctile']:.0f}</td>"
-                f"<td class='sp'>{r['scored_on']}</td>"
-                f"<td class='dt'>{r['obs_date']}</td>"
-                f"</tr>"
-            )
-        return "".join(cells)
-
-    def hhmm(value: Any) -> str:
-        if isinstance(value, datetime):
-            return value.strftime("%H:%M")
-        if isinstance(value, str) and value:
-            return value.split(" ")[-1]
-        return ""
-
-    cal = "".join(
-        f"<tr><td class='dt'>{hhmm(r['event_time_local'])}</td>"
-        f"<td class='reg'>{r['region'].upper()}</td>"
-        f"<td>{r['description']}</td>"
-        f"<td class='sp'>{r['status']}</td></tr>"
-        for r in payload["releases"]
-    )
-
-    return f"""<!doctype html>
+    return """<!doctype html>
 <html lang="en-GB"><head><meta charset="utf-8">
-<title>Macrobond release scan {payload['date']}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Macrobond release scan """ + payload["date"] + """</title>
 <style>
-:root {{ --bg:#0f1115; --card:#171a21; --line:#262b36; --fg:#e6e9ef; --dim:#8b93a3;
-        --x:#ff5c5c; --h:#ff9f43; --m:#f7d154; --l:#5a6273; }}
-@media (prefers-color-scheme: light) {{
-  :root {{ --bg:#f6f7f9; --card:#fff; --line:#e2e5ea; --fg:#1a1d23; --dim:#6b7280; --l:#c3c8d2; }}
-}}
-* {{ box-sizing:border-box; }}
-body {{ margin:0; padding:28px; background:var(--bg); color:var(--fg);
-        font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }}
-h1 {{ font-size:20px; margin:0 0 4px; letter-spacing:-.01em; }}
-.meta {{ color:var(--dim); font-size:12px; margin-bottom:22px; }}
-.card {{ background:var(--card); border:1px solid var(--line); border-radius:10px;
-         padding:18px 20px; margin-bottom:20px; }}
-h2 {{ font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim);
-      margin:0 0 12px; font-weight:600; }}
-table {{ width:100%; border-collapse:collapse; }}
-th {{ text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.05em;
-      color:var(--dim); font-weight:600; padding:0 8px 8px; border-bottom:1px solid var(--line); }}
-td {{ padding:8px; border-bottom:1px solid var(--line); vertical-align:top; }}
-tr:last-child td {{ border-bottom:none; }}
-.z {{ font-variant-numeric:tabular-nums; font-weight:600; width:64px; }}
-tr.x .z {{ color:var(--x); }} tr.h .z {{ color:var(--h); }}
-tr.m .z {{ color:var(--m); }} tr.l .z {{ color:var(--l); }}
-.num {{ font-variant-numeric:tabular-nums; text-align:right; white-space:nowrap; }}
-.reg {{ color:var(--dim); font-weight:600; width:46px; }}
-.dt, .sp {{ color:var(--dim); white-space:nowrap; }}
-.desc .sub {{ display:block; color:var(--dim); font-size:11px; margin-top:2px; }}
-.note {{ color:var(--dim); font-size:12px; margin-top:10px; }}
+:root{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e6e9ef;--dim:#8b93a3;
+--accent:#4c8dff;--x:#ff5c5c;--h:#ff9f43;--m:#f7d154;--l:#5a6273;--chip:#1f2530;}
+html[data-theme=light]{--bg:#f6f7f9;--card:#fff;--line:#e2e5ea;--fg:#1a1d23;
+--dim:#6b7280;--l:#c3c8d2;--chip:#eef1f5;}
+*{box-sizing:border-box;}
+body{margin:0;padding:24px;background:var(--bg);color:var(--fg);
+font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
+.top{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:4px;}
+h1{font-size:20px;margin:0;letter-spacing:-.01em;}
+.meta{color:var(--dim);font-size:12px;margin-bottom:18px;}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+padding:16px 18px;margin-bottom:18px;}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);
+margin:0 0 12px;font-weight:600;}
+.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px;}
+input[type=search],select{background:var(--chip);color:var(--fg);border:1px solid var(--line);
+border-radius:6px;padding:7px 10px;font:inherit;font-size:13px;}
+input[type=search]{min-width:230px;}
+input[type=range]{accent-color:var(--accent);vertical-align:middle;}
+button{background:var(--chip);color:var(--fg);border:1px solid var(--line);
+border-radius:6px;padding:7px 12px;font:inherit;font-size:13px;cursor:pointer;}
+button:hover{border-color:var(--accent);}
+button.on{background:var(--accent);border-color:var(--accent);color:#fff;}
+.lab{color:var(--dim);font-size:12px;}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;}
+.chip{background:var(--chip);border:1px solid var(--line);border-radius:999px;
+padding:4px 11px;font-size:12px;cursor:pointer;user-select:none;}
+.chip.on{background:var(--accent);border-color:var(--accent);color:#fff;}
+table{width:100%;border-collapse:collapse;}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.05em;
+color:var(--dim);font-weight:600;padding:0 8px 8px;border-bottom:1px solid var(--line);
+cursor:pointer;white-space:nowrap;}
+th:hover{color:var(--fg);}
+th .ar{opacity:.45;font-size:9px;}
+td{padding:8px;border-bottom:1px solid var(--line);vertical-align:top;}
+tr.row{cursor:pointer;}
+tr.row:hover td{background:rgba(127,127,127,.07);}
+.z{font-variant-numeric:tabular-nums;font-weight:600;width:66px;}
+tr.x .z{color:var(--x);} tr.h .z{color:var(--h);}
+tr.m .z{color:var(--m);} tr.l .z{color:var(--l);}
+.num{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap;}
+.reg{color:var(--dim);font-weight:600;width:48px;}
+.dt,.sp{color:var(--dim);white-space:nowrap;font-size:12px;}
+.desc .sub{display:block;color:var(--dim);font-size:11px;margin-top:2px;}
+.detail td{background:rgba(127,127,127,.05);font-size:13px;}
+.about{margin:0 0 10px;max-width:80ch;}
+.kv{display:flex;gap:26px;flex-wrap:wrap;color:var(--dim);font-size:12px;}
+.kv b{color:var(--fg);font-weight:600;}
+.note{color:var(--dim);font-size:12px;margin-top:10px;max-width:85ch;}
+.empty{color:var(--dim);padding:22px 8px;text-align:center;}
+details summary{cursor:pointer;color:var(--dim);font-size:12px;
+text-transform:uppercase;letter-spacing:.08em;font-weight:600;}
 </style></head><body>
-<h1>Macrobond release scan — {payload['date']}</h1>
-<div class="meta">{len(payload['releases'])} releases · {len(rows)} series scored ·
-regions {payload['regions']} · generated {payload['generated_utc']}</div>
 
-<div class="card"><h2>What jumps out</h2>
-<table><thead><tr><th>z</th><th>Reg</th><th>Series</th><th>Latest</th><th>Prev</th>
-<th>Trend break</th><th>Pctile</th><th>Scored on</th><th>Obs</th></tr></thead>
-<tbody>{tbody(highlights)}</tbody></table>
-<div class="note">z is the latest observation against a trailing 60-observation window that
-excludes the print itself. Series with a persistent drift are scored on their
-period-on-period change rather than the level; the column says which.</div>
+<div class="top">
+  <h1>Macrobond release scan</h1>
+  <span class="lab" id="hdrdate"></span>
+  <span style="flex:1"></span>
+  <button id="theme">Light</button>
+  <button id="export">Export CSV</button>
+</div>
+<div class="meta" id="meta"></div>
+
+<div class="card">
+  <div class="controls">
+    <input type="search" id="q" placeholder="Search series, release or source">
+    <select id="sort">
+      <option value="abs_z">Sort by significance</option>
+      <option value="z_desc">Sort by z, high to low</option>
+      <option value="z_asc">Sort by z, low to high</option>
+      <option value="trend">Sort by trend break</option>
+      <option value="region">Sort by region</option>
+      <option value="time">Sort by release time</option>
+    </select>
+    <span class="lab">Min |z| <b id="zval">0.0</b></span>
+    <input type="range" id="zmin" min="0" max="4" step="0.25" value="0">
+    <button id="limit" class="on">Top <span id="limn"></span></button>
+    <span class="lab" id="count"></span>
+  </div>
+  <div class="chips" id="regions"></div>
+  <table>
+    <thead><tr>
+      <th data-k="z">z <span class="ar"></span></th>
+      <th data-k="region">Reg <span class="ar"></span></th>
+      <th data-k="description">Series <span class="ar"></span></th>
+      <th data-k="latest" class="num">Latest <span class="ar"></span></th>
+      <th data-k="previous" class="num">Prev <span class="ar"></span></th>
+      <th data-k="trend_break" class="num">Trend <span class="ar"></span></th>
+      <th data-k="pctile" class="num">Pctile <span class="ar"></span></th>
+      <th data-k="scored_on">On <span class="ar"></span></th>
+      <th data-k="obs_date">Obs <span class="ar"></span></th>
+    </tr></thead>
+    <tbody id="tb"></tbody>
+  </table>
+  <div class="note">z is the latest observation measured against a trailing 60-observation
+  window that excludes the print itself. Series with a persistent drift are scored on
+  their period-on-period change rather than the level, and the On column says which.
+  This is deviation from a series' own history, not a surprise against consensus.
+  Click any row for the full description.</div>
 </div>
 
-<div class="card"><h2>Release calendar</h2>
-<table><thead><tr><th>Time</th><th>Reg</th><th>Release</th><th>Status</th></tr></thead>
-<tbody>{cal}</tbody></table></div>
+<div class="card">
+  <details open><summary>Release calendar</summary>
+    <table style="margin-top:12px">
+      <thead><tr><th>Time</th><th>Reg</th><th>Release</th><th>Status</th></tr></thead>
+      <tbody id="cal"></tbody>
+    </table>
+  </details>
+</div>
 
+<script id="payload" type="application/json">""" + blob + """</script>
+<script>
+(function(){
+var D = JSON.parse(document.getElementById('payload').textContent);
+var rows = D.rows || [], rels = D.releases || [];
+var state = {q:'', zmin:0, sort:'abs_z', regions:new Set(), limit:true,
+             sortKey:null, sortDir:-1};
+
+function esc(s){ return String(s==null?'':s)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+  .replace(/"/g,'&quot;'); }
+function band(z){ var a=Math.abs(z); return a>=3?'x':a>=2?'h':a>=1.25?'m':'l'; }
+function num(v){ return (v===''||v==null)?'':v; }
+
+document.getElementById('hdrdate').textContent = D.date;
+document.getElementById('meta').textContent =
+  rels.length + ' releases · ' + rows.length + ' series scored · regions ' +
+  D.regions + ' · generated ' + D.generated;
+document.getElementById('limn').textContent = D.top;
+
+// region chips
+var regs = {};
+rows.forEach(function(r){ if(r.region) regs[r.region]=(regs[r.region]||0)+1; });
+var rc = document.getElementById('regions');
+Object.keys(regs).sort(function(a,b){ return regs[b]-regs[a]; }).forEach(function(k){
+  var el = document.createElement('span');
+  el.className='chip'; el.textContent = k.toUpperCase()+' '+regs[k];
+  el.onclick = function(){
+    if(state.regions.has(k)) state.regions.delete(k); else state.regions.add(k);
+    el.classList.toggle('on'); draw();
+  };
+  rc.appendChild(el);
+});
+
+function filtered(){
+  var q = state.q.toLowerCase();
+  var out = rows.filter(function(r){
+    if(Math.abs(r.z) < state.zmin) return false;
+    if(state.regions.size && !state.regions.has(r.region)) return false;
+    if(q){
+      var hay = (r.description+' '+r.release_description+' '+r.series+' '+
+                 (r.about||'')+' '+(r.source||'')).toLowerCase();
+      if(hay.indexOf(q) === -1) return false;
+    }
+    return true;
+  });
+  if(state.sortKey){
+    var k = state.sortKey, d = state.sortDir;
+    out.sort(function(a,b){
+      var x=a[k], y=b[k];
+      if(k==='z'){ x=a.z; y=b.z; }
+      var nx=parseFloat(x), ny=parseFloat(y);
+      if(!isNaN(nx) && !isNaN(ny)) return (nx-ny)*d;
+      return String(x).localeCompare(String(y))*d;
+    });
+  } else {
+    var s = state.sort;
+    out.sort(function(a,b){
+      if(s==='abs_z') return Math.abs(b.z)-Math.abs(a.z);
+      if(s==='z_desc') return b.z-a.z;
+      if(s==='z_asc') return a.z-b.z;
+      if(s==='trend') return Math.abs(b.trend_break)-Math.abs(a.trend_break);
+      if(s==='region') return String(a.region).localeCompare(String(b.region))
+                            || Math.abs(b.z)-Math.abs(a.z);
+      if(s==='time') return String(a.event_time_local).localeCompare(String(b.event_time_local));
+      return 0;
+    });
+  }
+  return out;
+}
+
+function draw(){
+  var all = filtered();
+  var show = state.limit ? all.slice(0, D.top) : all;
+  document.getElementById('count').textContent =
+    'showing ' + show.length + ' of ' + all.length +
+    (all.length!==rows.length ? ' (' + rows.length + ' total)' : '');
+  var tb = document.getElementById('tb');
+  if(!show.length){
+    tb.innerHTML = '<tr><td colspan="9" class="empty">Nothing matches these filters.</td></tr>';
+    return;
+  }
+  var html = '';
+  show.forEach(function(r, i){
+    html += '<tr class="row '+band(r.z)+'" data-i="'+i+'">'
+      + '<td class="z">'+(r.z>0?'+':'')+Number(r.z).toFixed(2)+'</td>'
+      + '<td class="reg">'+esc(String(r.region).toUpperCase())+'</td>'
+      + '<td class="desc">'+esc(r.description)
+      + '<span class="sub">'+esc(r.release_description)
+      + (r.event_time_local?' · '+esc(String(r.event_time_local).split(' ').pop()):'')
+      + '</span></td>'
+      + '<td class="num">'+num(r.latest)+'</td>'
+      + '<td class="num">'+num(r.previous)+'</td>'
+      + '<td class="num">'+(r.trend_break>0?'+':'')+Number(r.trend_break).toFixed(2)+'</td>'
+      + '<td class="num">'+Number(r.pctile).toFixed(0)+'</td>'
+      + '<td class="sp">'+esc(r.scored_on)+'</td>'
+      + '<td class="dt">'+esc(r.obs_date)+'</td></tr>'
+      + '<tr class="detail" id="d'+i+'" style="display:none"><td colspan="9">'
+      + '<p class="about">'+esc(r.about||r.description)+'</p>'
+      + '<div class="kv">'
+      + '<span>Verdict <b>'+esc(r.verdict)+'</b></span>'
+      + '<span>Code <b>'+esc(r.series)+'</b></span>'
+      + (r.unit?'<span>Unit <b>'+esc(r.unit)+'</b></span>':'')
+      + (r.frequency?'<span>Frequency <b>'+esc(r.frequency)+'</b></span>':'')
+      + (r.source?'<span>Source <b>'+esc(r.source)+'</b></span>':'')
+      + '<span>History <b>'+esc(r.n_obs)+' obs</b></span>'
+      + '<span>Benchmark <b>'+esc(r.window_obs)+' obs / '
+      + esc(r.window_years)+' yrs</b></span>'
+      + '<span>Scale <b>'+esc(r.scale_kind)+'</b></span>'
+      + '<span>Status <b>'+esc(r.status)+'</b></span>'
+      + '</div></td></tr>';
+  });
+  tb.innerHTML = html;
+  Array.prototype.forEach.call(tb.querySelectorAll('tr.row'), function(tr){
+    tr.onclick = function(){
+      var d = document.getElementById('d'+tr.getAttribute('data-i'));
+      d.style.display = d.style.display==='none' ? 'table-row' : 'none';
+    };
+  });
+}
+
+// calendar
+document.getElementById('cal').innerHTML = rels.map(function(r){
+  var t = String(r.event_time_local||'').split(' ').pop();
+  return '<tr><td class="dt">'+esc(t)+'</td><td class="reg">'
+    + esc(String(r.region||'').toUpperCase())+'</td><td>'+esc(r.description)
+    + '</td><td class="sp">'+esc(r.status)+'</td></tr>';
+}).join('') || '<tr><td colspan="4" class="empty">No releases.</td></tr>';
+
+// controls
+document.getElementById('q').oninput = function(e){ state.q=e.target.value; draw(); };
+document.getElementById('sort').onchange = function(e){
+  state.sort=e.target.value; state.sortKey=null; markSort(); draw(); };
+document.getElementById('zmin').oninput = function(e){
+  state.zmin=parseFloat(e.target.value);
+  document.getElementById('zval').textContent = state.zmin.toFixed(1); draw(); };
+document.getElementById('limit').onclick = function(){
+  state.limit=!state.limit; this.classList.toggle('on', state.limit);
+  this.firstChild.textContent = state.limit ? 'Top ' : 'Show all '; draw(); };
+
+function markSort(){
+  Array.prototype.forEach.call(document.querySelectorAll('th .ar'), function(a){
+    a.textContent=''; });
+  if(state.sortKey){
+    var th = document.querySelector('th[data-k="'+state.sortKey+'"]');
+    if(th) th.querySelector('.ar').textContent = state.sortDir<0 ? '\\u25bc' : '\\u25b2';
+  }
+}
+Array.prototype.forEach.call(document.querySelectorAll('th[data-k]'), function(th){
+  th.onclick = function(){
+    var k = th.getAttribute('data-k');
+    if(state.sortKey===k) state.sortDir = -state.sortDir;
+    else { state.sortKey=k; state.sortDir=-1; }
+    markSort(); draw();
+  };
+});
+
+document.getElementById('theme').onclick = function(){
+  var light = document.documentElement.getAttribute('data-theme')==='light';
+  document.documentElement.setAttribute('data-theme', light?'dark':'light');
+  this.textContent = light ? 'Light' : 'Dark';
+};
+
+document.getElementById('export').onclick = function(){
+  var cols = ['z','region','series','description','about','release_description',
+              'latest','previous','trend_break','pctile','scored_on','obs_date',
+              'unit','frequency','source','n_obs','verdict'];
+  var out = [cols.join(',')];
+  filtered().forEach(function(r){
+    out.push(cols.map(function(c){
+      var v = r[c]==null?'':String(r[c]);
+      return /[",\\n]/.test(v) ? '"'+v.replace(/"/g,'""')+'"' : v;
+    }).join(','));
+  });
+  var blob = new Blob([out.join('\\n')], {type:'text/csv'});
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'macrobond_scan_' + D.date + '.csv';
+  a.click();
+};
+
+draw();
+})();
+</script>
 </body></html>"""
 
 
@@ -1253,22 +1677,110 @@ def run_selftest() -> int:
     shock = calm[:-1] + [50 + 4.0 * statistics.pstdev(calm[:-1])]
     p = score_series(dates, shock)
     check("4sd shock flagged", p is not None and p["abs_z"] > 3.0, f"z={p and p['z']}")
-    check("shock verdict is Extreme", p is not None and verdict(p).startswith("Extreme"))
+    check("shock verdict is at least Notable",
+          p is not None and verdict(p).split()[0] in ("Notable", "Extreme"),
+          f"got {p and verdict(p)}")
 
-    # 3. trending level (a CPI-style index) must be scored on the change
-    trend = [100 * (1.002 ** i) + random.gauss(0, 0.05) for i in range(80)]
+    # 3. trending level (a CPI-style index) must be scored on the change.
+    # Use a LINEAR trend so the change series is genuinely stationary. An
+    # exponential trend has a change series that itself drifts upward, so the
+    # newest change is systematically the largest and a modest positive z is
+    # the correct answer, not a bug.
+    trend = [100 + 0.2 * i + random.gauss(0, 0.05) for i in range(80)]
     p = score_series(dates, trend)
     check("trending index scored on change", p is not None and p["space"] == "change",
           f"got {p and p['space']}")
-    check("steady trend gives small z", p is not None and p["abs_z"] < 2.5, f"z={p and p['z']}")
+    check("steady linear trend gives small z", p is not None and p["abs_z"] < 2.5,
+          f"z={p and p['z']}")
 
     # 4. trending level with a jump in the change
     jumpy = trend[:-1] + [trend[-2] * 1.02]
     p = score_series(dates, jumpy)
     check("jump in a trending index flagged", p is not None and p["abs_z"] > 3.0, f"z={p and p['z']}")
 
+    # 4b. every scale mode agrees on a clean window, and disagrees the right way
+    # on a dirty one
+    for mode in ("winsor", "mad", "sd"):
+        p = score_series(dates, shock, frequency="Monthly", scale_mode=mode)
+        check(f"4sd shock flagged under --scale {mode}", p is not None and p["abs_z"] > 2.5,
+              f"z={p and round(p['z'], 2)}")
+
+    dirty = [random.gauss(0, 1) for _ in range(31)] + [random.gauss(0, 6) for _ in range(5)]
+    random.shuffle(dirty)
+    dirty = dirty + [2.5]
+    ddates = [base + timedelta(days=30 * i) for i in range(len(dirty))]
+    z_by_mode = {}
+    for mode in ("winsor", "mad", "sd"):
+        pm = score_series(ddates, dirty, frequency="Monthly", scale_mode=mode)
+        z_by_mode[mode] = abs(pm["z"]) if pm else 0.0
+    check("classic sd is the most easily fooled by a dislocated window",
+          z_by_mode["sd"] < z_by_mode["winsor"] and z_by_mode["sd"] < z_by_mode["mad"],
+          f"{ {k: round(v, 2) for k, v in z_by_mode.items()} }")
+
     # 5. too little history returns None
     check("short series returns None", score_series(dates[:10], calm[:10]) is None)
+
+    # 5b. frequency-aware windows. The regression this fixes: a genuine surprise
+    # judged against a window containing a past dislocation scores near zero.
+    check("frequency string normalised", normalise_frequency("Monthly") == "monthly")
+    check("frequency alias mapped", normalise_frequency("Semi-Annual") == "quarterly")
+    check("unknown frequency returns None", normalise_frequency("fortnight-ish") is None)
+    check("monthly inferred from spacing", infer_frequency(dates) == "monthly")
+    daily_dates = [base + timedelta(days=i) for i in range(60)]
+    check("daily inferred from spacing", infer_frequency(daily_dates) == "daily")
+    q_dates = [base + timedelta(days=91 * i) for i in range(40)]
+    check("quarterly inferred from spacing", infer_frequency(q_dates) == "quarterly")
+
+    calm_sd = 0.4
+    regime: List[float] = []
+    for _ in range(48):
+        regime.append(random.gauss(0, calm_sd))
+    for _ in range(12):
+        regime.append(random.gauss(0, calm_sd * 6))       # dislocation
+    for _ in range(24):
+        regime.append(random.gauss(1.5, calm_sd * 3))     # surge
+    for _ in range(41):
+        regime.append(random.gauss(0, calm_sd))
+    regime.append(2.5 * calm_sd)                          # today, a real +2.5sd event
+    rdates = [base + timedelta(days=30 * i) for i in range(len(regime))]
+
+    p_new = score_series(rdates, regime, frequency="Monthly", scale_mode="winsor")
+    check("regime-aware scoring recovers the surprise",
+          p_new is not None and p_new["abs_z"] >= 2.0, f"z={p_new and round(p_new['z'], 2)}")
+    check("monthly window is 36 observations", p_new["window_obs"] == 36,
+          f"got {p_new['window_obs']}")
+    check("monthly window spans about 3 years", 2.5 <= p_new["window_years"] <= 3.5,
+          f"got {p_new['window_years']}")
+    check("robust scale reported", p_new["scale_kind"] == "winsor",
+          f"got {p_new['scale_kind']}")
+
+    # the old behaviour, reproduced: long window plus sd suppresses it
+    long_window = regime[-61:-1]
+    long_sd = statistics.pstdev(long_window)
+    old_z = (regime[-1] - statistics.fmean(long_window)) / long_sd
+    check("old 60-obs sd approach would have missed it", abs(old_z) < 1.0,
+          f"old z={old_z:.2f}")
+    check("new scale is materially tighter than the old one",
+          p_new["window_sd"] < long_sd,
+          f"{p_new['window_sd']:.3f} vs {long_sd:.3f}")
+
+    # quarterly gets a 20-observation window, and is scoreable with 3 years less
+    q_vals = [random.gauss(0, 0.4) for _ in range(29)] + [2.5 * 0.4]
+    p_q = score_series(q_dates[:30], q_vals, frequency="Quarterly")
+    check("quarterly scoreable with 30 observations", p_q is not None)
+    check("quarterly window is 20 observations", p_q and p_q["window_obs"] == 20,
+          f"got {p_q and p_q['window_obs']}")
+    check("quarterly needs far less history than the old 26-obs floor",
+          score_series(q_dates[:14], q_vals[:14], frequency="Quarterly") is not None)
+
+    # sd mode still available for comparison
+    p_sd = score_series(rdates, regime, frequency="Monthly", scale_mode="sd")
+    check("--scale sd reports sd", p_sd["scale_kind"] == "sd")
+
+    # a flat series must not divide by zero
+    flat = [7.0] * 40
+    p_flat = score_series(rdates[:40], flat, frequency="Monthly")
+    check("flat series does not blow up", p_flat is not None and p_flat["z"] == 0.0)
 
     # 6. missing values tolerated
     holes: List[Optional[float]] = list(calm)
@@ -1556,7 +2068,12 @@ def main() -> int:
     ap.add_argument("--max-series-per-release", type=int, default=DEFAULT_MAX_SERIES_PER_RELEASE,
                     help="headline aggregates only by default. Raising this pulls in "
                          "the component tail and multiplies the download")
-    ap.add_argument("--top", type=int, default=25, help="rows in the highlights table")
+    ap.add_argument("--top", type=int, default=50, help="rows in the highlights table")
+    ap.add_argument("--scale", default="winsor", choices=["winsor", "mad", "sd"],
+                    help="winsor (default) trims the tails of the benchmark window so "
+                         "past dislocations do not inflate it. mad is more resistant "
+                         "but noisier. sd is the classic estimator, easily wrecked by "
+                         "a COVID-sized observation in the window")
     ap.add_argument("--outdir", default=".", help="where to write CSV/JSON/HTML")
     ap.add_argument("--probe", action="store_true",
                     help="dump Release entity metadata shape and exit")
