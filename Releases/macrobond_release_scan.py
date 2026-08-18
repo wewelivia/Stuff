@@ -825,6 +825,28 @@ def fetch_releases(api, regions: Optional[List[str]], verbose: bool = True,
     return list(collected.values())
 
 
+# Every metadata attribute that might carry a release event time. We do not
+# know which of these Macrobond populates, and the answer may differ between
+# releases, so we read them all and let the clock decide what is past.
+RELEASE_TIME_ATTRS = (
+    "LastReleaseEventTime", "LastReleaseEventTimeUTC", "PreviousReleaseEventTime",
+    "LastReleaseTime", "LastReleaseDate",
+    "NextReleaseEventTime", "NextReleaseEventTimeUTC", "NextReleaseTime",
+    "NextReleaseDate",
+)
+
+
+def release_time_coverage(releases: Iterable[Any]) -> Dict[str, int]:
+    """How many releases carry each candidate time attribute. Used to make a
+    missing attribute obvious instead of silently emptying the report."""
+    counts: Dict[str, int] = {}
+    for ent in releases:
+        for attr in RELEASE_TIME_ATTRS:
+            if _as_datetime(_meta(ent, attr)) is not None:
+                counts[attr] = counts.get(attr, 0) + 1
+    return counts
+
+
 def releases_in_range(releases: Iterable[Any], start: date, end: date,
                       tz_offset_hours: float) -> List[Dict[str, Any]]:
     """
@@ -836,24 +858,36 @@ def releases_in_range(releases: Iterable[Any], start: date, end: date,
     win_start = datetime.combine(start, time.min, tzinfo=timezone.utc) - shift
     win_end = datetime.combine(end, time.min, tzinfo=timezone.utc) - shift + timedelta(days=1)
 
+    now = datetime.now(timezone.utc)
+
     hits: List[Dict[str, Any]] = []
     for ent in releases:
         name = _entity_name(ent)
         if not name:
             continue
-        last = _as_datetime(_meta(ent, "LastReleaseEventTime"))
-        nxt = _as_datetime(_meta(ent, "NextReleaseEventTime"))
 
-        status = None
-        event_time = None
-        if last is not None and win_start <= last < win_end:
-            status = "Released"
-            event_time = last
-        elif nxt is not None and win_start <= nxt < win_end:
-            status = "Upcoming"
-            event_time = nxt
-        if status is None:
+        # Collect every event time this release advertises, under any of the
+        # names Macrobond might use. Status is then decided by the clock, not
+        # by which attribute the timestamp happened to arrive in. The previous
+        # version required LastReleaseEventTime to be present and in range,
+        # so if that attribute was missing every release looked Upcoming for
+        # ever and nothing was ever scored.
+        candidates: List[datetime] = []
+        for attr in RELEASE_TIME_ATTRS:
+            value = _as_datetime(_meta(ent, attr))
+            if value is not None:
+                candidates.append(value)
+
+        in_window = [t for t in candidates if win_start <= t < win_end]
+        if not in_window:
             continue
+
+        past = [t for t in in_window if t <= now]
+        future = [t for t in in_window if t > now]
+        if past:
+            status, event_time = "Released", max(past)
+        else:
+            status, event_time = "Upcoming", min(future)
 
         local = event_time + shift if event_time else None
         hits.append({
@@ -1233,6 +1267,20 @@ def run_scan(args) -> Dict[str, Any]:
             to_score = released
         if upcoming and args.status == "released":
             print(f"  skipping {len(upcoming)} upcoming releases, no new print to score")
+
+        # Nothing released but plenty scheduled, on a window that is already in
+        # the past, means the event times are not what we think they are.
+        if not released and upcoming and end_date <= date.today():
+            print("\n  WARNING: no release in this window looks to have happened yet,")
+            print("  even though the window is not in the future. Event time coverage:")
+            coverage = release_time_coverage(releases)
+            if coverage:
+                for attr, n in sorted(coverage.items(), key=lambda kv: -kv[1]):
+                    print(f"    {attr:<28} {n} of {len(releases)} releases")
+            else:
+                print("    NONE of the candidate time attributes parsed on any release.")
+            print("  Check --tz-offset, and run --probe to see the real attribute names.")
+            print("  Meanwhile --status all will score everything in the window.")
 
         if not to_score:
             print("  nothing to score. The calendar is still written to the report.")
@@ -2645,6 +2693,47 @@ def run_selftest() -> int:
         {"Name": "r3", "Description": "D3", "Region": "de",
          "LastReleaseEventTime": "2026-08-20T09:00:00Z"},
     ]
+    # 9g2. status must come from the clock, not from which attribute holds the
+    # timestamp. The bug this pins: with no LastReleaseEventTime anywhere,
+    # every release looked Upcoming for ever and nothing was ever scored.
+    yesterday = date.today() - timedelta(days=1)
+    tomorrow = date.today() + timedelta(days=1)
+    ys = yesterday.strftime("%Y-%m-%dT09:00:00Z")
+    ts = tomorrow.strftime("%Y-%m-%dT09:00:00Z")
+
+    next_only = [{"Name": "cn_ip", "Description": "China IP", "Region": "cn",
+                  "NextReleaseEventTime": ys}]
+    hit = releases_in_range(next_only, yesterday, yesterday, 0.0)
+    check("a past event is Released even when only NextReleaseEventTime exists",
+          len(hit) == 1 and hit[0]["status"] == "Released",
+          f"got {[h['status'] for h in hit]}")
+
+    future_only = [{"Name": "us_cpi", "Description": "US CPI", "Region": "us",
+                    "NextReleaseEventTime": ts}]
+    hit = releases_in_range(future_only, tomorrow, tomorrow, 0.0)
+    check("a genuinely future event is still Upcoming",
+          len(hit) == 1 and hit[0]["status"] == "Upcoming",
+          f"got {[h['status'] for h in hit]}")
+
+    alt_name = [{"Name": "jp_x", "Description": "JP", "Region": "jp",
+                 "NextReleaseDate": ys}]
+    check("alternative attribute names are read too",
+          len(releases_in_range(alt_name, yesterday, yesterday, 0.0)) == 1)
+
+    both = [{"Name": "b", "Description": "B", "Region": "gb",
+             "LastReleaseEventTime": ys, "NextReleaseEventTime": ts}]
+    hit = releases_in_range(both, yesterday, tomorrow, 0.0)
+    check("with past and future in range, the past one wins",
+          len(hit) == 1 and hit[0]["status"] == "Released",
+          f"got {[h['status'] for h in hit]}")
+
+    cov = release_time_coverage(next_only + alt_name + both)
+    check("coverage report counts each attribute",
+          cov.get("NextReleaseEventTime") == 2 and cov.get("NextReleaseDate") == 1,
+          f"got {cov}")
+    check("coverage is empty when nothing parses",
+          release_time_coverage([{"Name": "x", "Region": "us"}]) == {})
+
     span_hits = releases_in_range(range_ents, date(2026, 8, 14), date(2026, 8, 17), 0.0)
     check("range picks up both ends inclusively", len(span_hits) == 2, f"got {len(span_hits)}")
     check("out-of-range release excluded",
@@ -2701,8 +2790,12 @@ def run_selftest() -> int:
 
     hits = releases_on_day(ents, date(2026, 8, 17), 0.0)
     check("two releases match the target day", len(hits) == 2, f"got {len(hits)}")
-    check("released vs upcoming split correctly",
-          {h["release"]: h["status"] for h in hits} == {"rel_a": "Released", "rel_b": "Upcoming"})
+    # Both fixtures sit on a date that has now passed, so both are Released.
+    # Which attribute carried the timestamp is deliberately irrelevant; the
+    # past/future split is covered by the dedicated checks above.
+    check("a past window reports everything as Released",
+          {h["release"]: h["status"] for h in hits} == {"rel_a": "Released", "rel_b": "Released"},
+          f"got { {h['release']: h['status'] for h in hits} }")
     hits_tokyo = releases_on_day(ents, date(2026, 8, 17), 9.0)
     check("timezone shift pulls in the Japanese print",
           any(h["release"] == "rel_c" for h in hits_tokyo))
