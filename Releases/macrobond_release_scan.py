@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import json
 import math
 import os
@@ -123,11 +124,19 @@ TYPE_LIKE_ATTRS = (
 COMPANY_TYPE_PATTERNS = ("compan", "corporate", "earning", "issuer", "security", "equity")
 ECONOMIC_TYPE_PATTERNS = ("econom", "macro", "statistic", "indicator")
 
-# Last-resort wording check on the description.
+# Macrobond names corporate releases rel_com<digits>_..., which is a far more
+# reliable signal than any wording test.
+COMPANY_NAME_RE = re.compile(r"^rel_com\d+", re.I)
+
+# Last-resort wording check. Kept deliberately narrow: single words like
+# "earnings", "profit" and "dividend" wrongly caught BLS releases such as
+# "Usual Weekly Earnings of Wage & Salary Workers" and "Average Real Earnings",
+# so every pattern here must be a phrase that only a corporate release uses.
 COMPANY_TEXT_PATTERNS = (
-    "earnings", "quarterly results", "annual results", "interim results",
-    "financial results", "trading update", "annual report", "10-q", "10-k",
-    "results release", "profit", "dividend",
+    "quarterly results", "annual results", "interim results",
+    "financial results", "trading update", "annual report",
+    "10-q", "10-k", "results release", "earnings release", "earnings call",
+    "quarterly earnings", "half-year results", "full-year results",
 )
 
 # Scoring windows are per frequency, in observations. A flat 60 observations
@@ -141,21 +150,31 @@ COMPANY_TEXT_PATTERNS = (
 #   recent : observations averaged for the near end of the trend-break measure
 #   prior  : observations averaged for the far end
 FREQ_CONFIG: Dict[str, Dict[str, int]] = {
-    "daily":     {"window": 250, "min": 60, "recent": 5, "prior": 20},
-    "weekly":    {"window": 104, "min": 30, "recent": 4, "prior": 13},
-    "monthly":   {"window": 36,  "min": 18, "recent": 3, "prior": 12},
-    "quarterly": {"window": 20,  "min": 10, "recent": 2, "prior": 6},
-    "annual":    {"window": 12,  "min": 8,  "recent": 1, "prior": 4},
+    "daily":       {"window": 250, "min": 60, "recent": 5, "prior": 20},
+    "weekly":      {"window": 104, "min": 30, "recent": 4, "prior": 13},
+    "monthly":     {"window": 36,  "min": 18, "recent": 3, "prior": 12},
+    "bimonthly":   {"window": 24,  "min": 12, "recent": 2, "prior": 8},
+    "quarterly":   {"window": 20,  "min": 10, "recent": 2, "prior": 6},
+    "quadmonthly": {"window": 18,  "min": 9,  "recent": 2, "prior": 6},
+    "semiannual":  {"window": 12,  "min": 6,  "recent": 1, "prior": 4},
+    "annual":      {"window": 12,  "min": 8,  "recent": 1, "prior": 4},
 }
 DEFAULT_FREQ = "monthly"
 
-# Macrobond frequency strings vary; map what we see onto the table above.
+# The observed vocabulary on Macrobond Release entities is exactly:
+# monthly, quarterly, annual, daily, weekly, semiannual, bimonthly, quadmonthly.
+# Macrobond uses bimonthly for every two months and quadmonthly for every four,
+# so both are less frequent than monthly, not more.
 FREQ_ALIASES = {
     "daily": "daily", "business daily": "daily", "bdaily": "daily", "d": "daily",
-    "weekly": "weekly", "biweekly": "weekly", "fortnightly": "weekly", "w": "weekly",
+    "weekly": "weekly", "w": "weekly",
+    "biweekly": "weekly", "fortnightly": "weekly",
     "monthly": "monthly", "m": "monthly",
+    "bimonthly": "bimonthly",
     "quarterly": "quarterly", "q": "quarterly",
-    "semiannual": "quarterly", "semi-annual": "quarterly", "halfyearly": "quarterly",
+    "quadmonthly": "quadmonthly",
+    "semiannual": "semiannual", "semi-annual": "semiannual",
+    "halfyearly": "semiannual", "half-yearly": "semiannual",
     "annual": "annual", "yearly": "annual", "a": "annual", "y": "annual",
 }
 
@@ -321,6 +340,10 @@ def classify_release(entity: Any) -> Tuple[str, str]:
     """
     md = _as_mapping(entity)
     lowered = {k.lower(): v for k, v in md.items()}
+
+    name = _entity_name(entity) or ""
+    if COMPANY_NAME_RE.match(name):
+        return "company", "rel_com* name"
 
     for attr in COMPANY_MARKER_ATTRS:
         if attr.lower() in lowered and lowered[attr.lower()] not in (None, "", []):
@@ -954,6 +977,7 @@ def releases_in_range(releases: Iterable[Any], start: date, end: date,
             "description": _meta(ent, "Description") or _meta(ent, "FullDescription") or name,
             "region": (_meta(ent, "Region") or "").lower(),
             "source": _meta(ent, "Source") or "",
+            "release_frequency": _meta(ent, "ReleaseFrequency") or "",
             "importance": level,
             "importance_label": IMPORTANCE_LABELS.get(level, ""),
             "importance_raw": raw_importance,
@@ -1222,9 +1246,16 @@ def run_probe(api, regions: Optional[List[str]], outdir: str = ".") -> None:
                 lvl, _ = normalise_importance({attr: v})
                 print(f"      {n:>6}  {v!r}  -> level {lvl}")
     if not found_attr:
-        print("  none of the candidate importance attributes are present.")
-        print("  Look through the value distributions above for the flag you saw in")
-        print("  the Macrobond app, then pass it with --importance-attr NAME.")
+        print("  none of the candidate importance attributes are present on Release.")
+        print("  Every attribute seen on any Release entity, so nothing is missed:")
+        every: Dict[str, int] = {}
+        for ent in releases:
+            for k in _as_mapping(ent):
+                every[k] = every.get(k, 0) + 1
+        print("    " + ", ".join(sorted(every)))
+        print("  If the flag is not in that list it is not on the Release entity.")
+        print("  It may sit on the member series instead; the series sample below")
+        print("  prints their attributes too.")
     else:
         levels: Dict[int, int] = {}
         for ent in releases:
@@ -1277,6 +1308,16 @@ def run_probe(api, regions: Optional[List[str]], outdir: str = ".") -> None:
             print(f"  {len(rows)} member series")
             for row in rows[:5]:
                 print(f"    {_entity_name(row)}  |  {_meta(row, 'Description')}")
+            if rows:
+                keys: Dict[str, int] = {}
+                for row in rows:
+                    for k in _as_mapping(row):
+                        keys[k] = keys.get(k, 0) + 1
+                print("\n  attributes present on member series:")
+                print("    " + ", ".join(sorted(keys)))
+                print("\n  first member series in full:")
+                for k, v in sorted(_as_mapping(rows[0]).items()):
+                    print(f"    {k}: {v!r}")
         except Exception as exc:  # noqa: BLE001
             print(f"  member lookup failed: {exc}")
 
@@ -1316,7 +1357,17 @@ def run_scan(args) -> Dict[str, Any]:
 
         print("\n[1/4] fetching release calendar")
         cache_key = f"{args.regions}|{args.exclude}|{args.kind}|{args.must_have}|{args.must_not_have}"
-        releases = cache.get_calendar(cache_key, args.calendar_ttl_hours)
+
+        # LastReleaseEventTime is the field that tells us whether a release has
+        # happened yet, and it changes through the day. Serving a cached
+        # calendar for a window that includes today therefore reports this
+        # morning's prints as still upcoming. Cache only fully historic windows.
+        ttl = args.calendar_ttl_hours
+        if end_date >= date.today():
+            ttl = 0.0
+            if not args.no_cache:
+                print("  window includes today, so the calendar is fetched fresh")
+        releases = cache.get_calendar(cache_key, ttl)
         if releases is None:
             releases = fetch_releases(
                 api, regions,
@@ -1431,8 +1482,11 @@ def run_scan(args) -> Dict[str, Any]:
             if s is None:
                 continue
             dates, values = series_arrays(s)
+            # Prefer the series' own frequency, then the release cadence, which
+            # Macrobond populates as ReleaseFrequency, then infer from spacing.
             profile = score_series(dates, values,
-                                   frequency=_meta(s, "Frequency"),
+                                   frequency=(_meta(s, "Frequency")
+                                              or rel.get("release_frequency")),
                                    scale_mode=args.scale)
             if profile is None:
                 continue
@@ -2554,7 +2608,8 @@ def run_selftest() -> int:
     # 5b. frequency-aware windows. The regression this fixes: a genuine surprise
     # judged against a window containing a past dislocation scores near zero.
     check("frequency string normalised", normalise_frequency("Monthly") == "monthly")
-    check("frequency alias mapped", normalise_frequency("Semi-Annual") == "quarterly")
+    check("frequency alias mapped", normalise_frequency("Semi-Annual") == "semiannual",
+          f"got {normalise_frequency('Semi-Annual')}")
     check("unknown frequency returns None", normalise_frequency("fortnight-ish") is None)
     check("monthly inferred from spacing", infer_frequency(dates) == "monthly")
     daily_dates = [base + timedelta(days=i) for i in range(60)]
@@ -2854,6 +2909,43 @@ def run_selftest() -> int:
         {"Name": "r3", "Description": "D3", "Region": "de",
          "LastReleaseEventTime": "2026-08-20T09:00:00Z"},
     ]
+    # 9g0. real Macrobond vocabulary, taken from live probe output
+    yesterday = date.today() - timedelta(days=1)
+    tomorrow = date.today() + timedelta(days=1)
+    ys = yesterday.strftime("%Y-%m-%dT09:00:00Z")
+    ts = tomorrow.strftime("%Y-%m-%dT09:00:00Z")
+
+    check("bimonthly is less frequent than monthly, not more",
+          FREQ_CONFIG[normalise_frequency("bimonthly")]["window"]
+          < FREQ_CONFIG["monthly"]["window"])
+    for word in ("monthly", "quarterly", "annual", "daily", "weekly",
+                 "semiannual", "bimonthly", "quadmonthly"):
+        check(f"live frequency {word!r} maps to a real config",
+              normalise_frequency(word) in FREQ_CONFIG,
+              f"got {normalise_frequency(word)}")
+
+    # The wording rule wrongly caught these three real BLS economic releases.
+    for desc in ("Usual Weekly Earnings of Wage & Salary Workers",
+                 "Average Real Earnings",
+                 "CPS Weekly & Hourly Earnings (Add-On)"):
+        ent = {"Name": "rel_usx", "Description": desc, "Region": "us"}
+        check(f"{desc[:34]!r} is economic",
+              classify_release(ent)[0] == "economic", f"got {classify_release(ent)}")
+
+    check("rel_com* name marks a company release",
+          classify_release({"Name": "rel_com93301_sales",
+                            "Description": "Tesla Motors US Car Sales",
+                            "Region": "us"})[0] == "company")
+    check("a real earnings release is still caught",
+          classify_release({"Name": "rel_x", "Description": "Q3 Earnings Release",
+                            "Region": "us"})[0] == "company")
+    check("release frequency flows into scoring",
+          releases_in_range([{"Name": "r", "Description": "D", "Region": "us",
+                              "ReleaseFrequency": "quarterly",
+                              "LastReleaseEventTime": ys}],
+                            yesterday, yesterday, 0.0)[0]["release_frequency"]
+          == "quarterly")
+
     # 9g1. importance normalisation
     check("word importance mapped", normalise_importance({"Importance": "High"})[0] == 3)
     check("medium mapped", normalise_importance({"Impact": "Medium"})[0] == 2)
@@ -3052,7 +3144,10 @@ def main() -> int:
     ap.add_argument("--no-cache", action="store_true", help="bypass the cache entirely")
     ap.add_argument("--refresh-cache", action="store_true",
                     help="discard the cached calendar and membership, keep timestamps")
-    ap.add_argument("--calendar-ttl-hours", type=float, default=12.0)
+    ap.add_argument("--calendar-ttl-hours", type=float, default=12.0,
+                    help="how long a cached calendar stays valid. Ignored whenever "
+                         "the scan window includes today, because release times "
+                         "change through the day")
     ap.add_argument("--members-ttl-days", type=float, default=7.0,
                     help="how long to trust cached release membership")
     ap.add_argument("--full-download", action="store_true",
