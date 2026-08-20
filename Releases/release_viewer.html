@@ -53,8 +53,6 @@ tr.m .z{color:var(--m);} tr.l .z{color:var(--l);}
 .kv b{color:var(--fg);font-weight:600;}
 .note{color:var(--dim);font-size:12px;margin-top:10px;max-width:85ch;}
 .empty{color:var(--dim);padding:22px 8px;text-align:center;}
-.star{color:var(--m);letter-spacing:-1px;font-size:11px;vertical-align:1px;}
-tr.row.imp td:first-child{box-shadow:inset 3px 0 0 var(--m);}
 details summary{cursor:pointer;color:var(--dim);font-size:12px;
 text-transform:uppercase;letter-spacing:.08em;font-weight:600;}
 #drop{border:2px dashed var(--line);border-radius:10px;padding:40px 20px;text-align:center;
@@ -97,15 +95,9 @@ color:var(--dim);transition:border-color .15s,background .15s;}
       <option value="time">Sort by release time</option>
     </select>
     <select id="day"><option value="">All dates</option></select>
-    <select id="imp">
-      <option value="0">All releases</option>
-      <option value="2">Important only</option>
-      <option value="3">Top importance only</option>
-    </select>
     <span class="lab">Min |z| <b id="zval">0.0</b></span>
     <input type="range" id="zmin" min="0" max="4" step="0.25" value="0">
     <button id="limit" class="on">Top <span id="limn">50</span></button>
-    <button id="keepimp" class="on" title="Important releases stay visible even when they fall outside the top N">Keep important</button>
     <span class="lab" id="count"></span>
   </div>
   <div class="chips" id="regions"></div>
@@ -144,10 +136,7 @@ color:var(--dim);transition:border-color .15s,background .15s;}
 (function(){
 var rows = [], rels = [], meta = {};
 var state = {q:'', zmin:0, sort:'abs_z', regions:new Set(), limit:true,
-             sortKey:null, sortDir:-1, day:'', top:50, imp:0, keepImp:true};
-
-function impOf(r){ var v = parseInt(r.importance,10); return isNaN(v)?0:v; }
-function stars(n){ return n>=3?'★★★':n>=2?'★★':n>=1?'★':''; }
+             sortKey:null, sortDir:-1, day:'', top:50};
 
 function esc(s){ return String(s==null?'':s)
   .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
@@ -337,7 +326,6 @@ function afterLoad(reports){
 function filtered(){
   var q=state.q.toLowerCase();
   var out=rows.filter(function(r){
-    if(state.imp && impOf(r) < state.imp) return false;
     if(Math.abs(r.z) < state.zmin) return false;
     if(state.day && r.release_date !== state.day) return false;
     if(state.regions.size && !state.regions.has(r.region)) return false;
@@ -374,25 +362,9 @@ function filtered(){
 
 function draw(){
   var all=filtered();
-  var show=all, added=0;
-  if(state.limit){
-    show = all.slice(0, state.top);
-    if(state.keepImp){
-      // An important release that lands outside the top N is exactly the case
-      // this is for: unremarkable print, still worth seeing. Append rather
-      // than drop, keeping the original sort order among the extras.
-      var seen = {};
-      show.forEach(function(r){ seen[r.series+'|'+r.release_date]=1; });
-      var extra = all.filter(function(r){
-        return impOf(r) >= 2 && !seen[r.series+'|'+r.release_date];
-      });
-      added = extra.length;
-      show = show.concat(extra);
-    }
-  }
+  var show = state.limit ? all.slice(0, state.top) : all;
   document.getElementById('count').textContent =
     'showing '+show.length+' of '+all.length+
-    (added? ' (incl. '+added+' important below the cut)':'')+
     (all.length!==rows.length? ' · '+rows.length+' total':'');
   var tb=document.getElementById('tb');
   if(!show.length){
@@ -401,13 +373,10 @@ function draw(){
   }
   var html='';
   show.forEach(function(r,i){
-    html += '<tr class="row '+band(r.z)+(impOf(r)>=2?' imp':'')+'" data-i="'+i+'">'
+    html += '<tr class="row '+band(r.z)+'" data-i="'+i+'">'
       + '<td class="z">'+(r.z>0?'+':'')+Number(r.z).toFixed(2)+'</td>'
       + '<td class="reg">'+esc(String(r.region).toUpperCase())+'</td>'
-      + '<td class="desc">'
-      + (impOf(r)>=1? '<span class="star" title="Macrobond importance: '
-          + esc(r.importance_label||impOf(r)) + '">'+stars(impOf(r))+'</span> ' : '')
-      + esc(r.description)
+      + '<td class="desc">'+esc(r.description)
       + '<span class="sub">'+esc(r.release_description)
       + (r.release_date? ' · '+esc(r.release_date):'')
       + (r.event_time_local? ' '+esc(String(r.event_time_local).split(' ').pop()):'')
@@ -484,10 +453,6 @@ document.getElementById('q').oninput=function(e){ state.q=e.target.value; draw()
 document.getElementById('sort').onchange=function(e){
   state.sort=e.target.value; state.sortKey=null; markSort(); draw(); };
 document.getElementById('day').onchange=function(e){ state.day=e.target.value; draw(); };
-document.getElementById('imp').onchange=function(e){
-  state.imp=parseInt(e.target.value,10)||0; draw(); };
-document.getElementById('keepimp').onclick=function(){
-  state.keepImp=!state.keepImp; this.classList.toggle('on',state.keepImp); draw(); };
 document.getElementById('zmin').oninput=function(e){
   state.zmin=parseFloat(e.target.value);
   document.getElementById('zval').textContent=state.zmin.toFixed(1); draw(); };
