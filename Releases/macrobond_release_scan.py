@@ -825,6 +825,63 @@ def fetch_releases(api, regions: Optional[List[str]], verbose: bool = True,
     return list(collected.values())
 
 
+# Macrobond marks some releases as more important than others. As with the
+# event times we do not know the attribute name, so read every plausible one.
+# --probe prints the value distribution of each, which will confirm it.
+IMPORTANCE_ATTRS = (
+    "Importance", "ReleaseImportance", "Impact", "MarketImportance",
+    "Significance", "Priority", "ImportanceLevel", "IsImportant", "Important",
+)
+
+# Words seen in importance-like fields, mapped onto a 0-3 scale.
+IMPORTANCE_WORDS = {
+    "high": 3, "important": 3, "major": 3, "critical": 3, "top": 3,
+    "true": 3, "yes": 3, "y": 3, "***": 3,
+    "medium": 2, "med": 2, "moderate": 2, "normal": 2, "**": 2,
+    "low": 1, "minor": 1, "*": 1,
+    "none": 0, "false": 0, "no": 0, "n": 0, "": 0,
+}
+IMPORTANCE_LABELS = {0: "", 1: "low", 2: "medium", 3: "high"}
+
+
+def normalise_importance(entity: Any, attr_override: str = "") -> Tuple[int, str]:
+    """
+    Return (level 0-3, raw value as text) for a release.
+
+    Handles the three shapes this could plausibly arrive in: a small integer
+    rank, a percentage-ish number, or a word. Unknown or absent means 0, which
+    is treated as "not flagged" rather than "unimportant", so a missing
+    attribute never silently downgrades everything.
+    """
+    attrs = (attr_override,) + IMPORTANCE_ATTRS if attr_override else IMPORTANCE_ATTRS
+    for attr in attrs:
+        raw = _meta(entity, attr)
+        if raw is None or raw == "":
+            continue
+        text = str(_first(raw)).strip()
+        low = text.lower()
+
+        if low in IMPORTANCE_WORDS:
+            return IMPORTANCE_WORDS[low], text
+
+        number = _safe_float(text)
+        if number is not None:
+            if number <= 3:
+                return max(0, min(3, int(round(number)))), text
+            if number <= 5:
+                return 3 if number >= 4 else 2, text
+            # a 0-100 style score
+            if number >= 67:
+                return 3, text
+            if number >= 34:
+                return 2, text
+            return 1, text
+
+        # a bare word we do not recognise, but present at all, counts as flagged
+        return 2, text
+    return 0, ""
+
+
 # Every metadata attribute that might carry a release event time. We do not
 # know which of these Macrobond populates, and the answer may differ between
 # releases, so we read them all and let the clock decide what is past.
@@ -848,7 +905,8 @@ def release_time_coverage(releases: Iterable[Any]) -> Dict[str, int]:
 
 
 def releases_in_range(releases: Iterable[Any], start: date, end: date,
-                      tz_offset_hours: float) -> List[Dict[str, Any]]:
+                      tz_offset_hours: float,
+                      importance_attr: str = "") -> List[Dict[str, Any]]:
     """
     Release entities whose last or next event falls between start and end,
     inclusive of both days. Local time, so the window boundaries are shifted
@@ -889,12 +947,16 @@ def releases_in_range(releases: Iterable[Any], start: date, end: date,
         else:
             status, event_time = "Upcoming", min(future)
 
+        level, raw_importance = normalise_importance(ent, importance_attr)
         local = event_time + shift if event_time else None
         hits.append({
             "release": name,
             "description": _meta(ent, "Description") or _meta(ent, "FullDescription") or name,
             "region": (_meta(ent, "Region") or "").lower(),
             "source": _meta(ent, "Source") or "",
+            "importance": level,
+            "importance_label": IMPORTANCE_LABELS.get(level, ""),
+            "importance_raw": raw_importance,
             "status": status,
             "event_time_utc": event_time,
             "event_time_local": local,
@@ -1145,6 +1207,32 @@ def run_probe(api, regions: Optional[List[str]], outdir: str = ".") -> None:
         for v, n in sorted(values.items(), key=lambda kv: -kv[1]):
             print(f"      {n:>6}  {v}")
 
+    print("\nimportance detection:")
+    found_attr = None
+    for attr in IMPORTANCE_ATTRS:
+        vals: Dict[str, int] = {}
+        for ent in releases:
+            raw = _meta(ent, attr)
+            if raw not in (None, "", []):
+                vals[str(_first(raw))] = vals.get(str(_first(raw)), 0) + 1
+        if vals:
+            found_attr = found_attr or attr
+            print(f"  {attr}: present on {sum(vals.values())} of {len(releases)}")
+            for v, n in sorted(vals.items(), key=lambda kv: -kv[1])[:8]:
+                lvl, _ = normalise_importance({attr: v})
+                print(f"      {n:>6}  {v!r}  -> level {lvl}")
+    if not found_attr:
+        print("  none of the candidate importance attributes are present.")
+        print("  Look through the value distributions above for the flag you saw in")
+        print("  the Macrobond app, then pass it with --importance-attr NAME.")
+    else:
+        levels: Dict[int, int] = {}
+        for ent in releases:
+            lvl, _ = normalise_importance(ent)
+            levels[lvl] = levels.get(lvl, 0) + 1
+        print("  resulting level distribution: " +
+              ", ".join(f"{k}={levels[k]}" for k in sorted(levels)))
+
     print("\nclassification under the current heuristic:")
     tally: Dict[str, int] = {}
     reasons: Dict[str, int] = {}
@@ -1244,8 +1332,24 @@ def run_scan(args) -> Dict[str, Any]:
             print(f"  from cache, under {args.calendar_ttl_hours}h old")
         print(f"  {len(releases)} {args.kind} releases after filtering")
 
-        todays = releases_in_range(releases, start_date, end_date, args.tz_offset)
-        todays = todays[:args.max_releases]
+        todays = releases_in_range(releases, start_date, end_date, args.tz_offset,
+                                   args.importance_attr)
+        if args.min_importance > 0:
+            before = len(todays)
+            todays = [r for r in todays if r["importance"] >= args.min_importance]
+            print(f"  {len(todays)} of {before} releases at importance "
+                  f">= {args.min_importance}")
+
+        # The max-releases cut is a safety valve, not an editorial decision.
+        # Flagged releases are kept whatever it says.
+        if len(todays) > args.max_releases:
+            flagged = [r for r in todays if r["importance"] >= 2]
+            rest = [r for r in todays if r["importance"] < 2]
+            keep = flagged + rest[:max(0, args.max_releases - len(flagged))]
+            kept_names = {r["release"] for r in keep}
+            todays = [r for r in todays if r["release"] in kept_names]
+            print(f"  capped at {args.max_releases} releases, "
+                  f"{len(flagged)} flagged ones kept regardless")
         released = [r for r in todays if r["status"] == "Released"]
         upcoming = [r for r in todays if r["status"] != "Released"]
         print(f"  {len(todays)} releases in {label} "
@@ -1338,6 +1442,8 @@ def run_scan(args) -> Dict[str, Any]:
                 "region": rel["region"] or (_meta(s, "Region") or ""),
                 "status": rel["status"],
                 "release_date": rel.get("release_date", ""),
+                "importance": rel.get("importance", 0),
+                "importance_label": rel.get("importance_label", ""),
                 "event_time_local": rel["event_time_local"].strftime("%Y-%m-%d %H:%M") if rel["event_time_local"] else "",
                 "series": name,
                 "description": _meta(s, "Description") or name,
@@ -1382,7 +1488,8 @@ def run_scan(args) -> Dict[str, Any]:
 # --------------------------------------------------------------------------
 
 CSV_FIELDS = [
-    "release_date", "release", "release_description", "region", "status",
+    "release_date", "importance", "importance_label", "release",
+    "release_description", "region", "status",
     "event_time_local", "series", "description", "about", "source", "unit",
     "frequency", "obs_date", "latest", "previous", "scored_on", "z", "abs_z",
     "trend_break", "pctile", "n_obs", "window_obs", "window_years",
@@ -1391,7 +1498,8 @@ CSV_FIELDS = [
 
 # Calendar rows go to their own CSV so the viewer can show releases that
 # produced no scored series, which reconstructing from the data alone loses.
-CALENDAR_FIELDS = ["release_date", "event_time_local", "region", "release",
+CALENDAR_FIELDS = ["release_date", "event_time_local", "region", "importance",
+                   "importance_label", "importance_raw", "release",
                    "description", "source", "status"]
 
 VIEWER_FILENAME = "release_viewer.html"
@@ -1466,9 +1574,27 @@ def write_outputs(payload: Dict[str, Any], args, top: int = 50) -> None:
     for path in written:
         print(f"  {path}")
 
+    # Flagged releases get their own block. The whole point is that they are
+    # worth seeing even when the print was unremarkable, so they must not have
+    # to earn their place on |z|.
+    flagged = [r for r in payload["rows"] if int(r.get("importance") or 0) >= 2]
+    if flagged:
+        best: Dict[str, Dict[str, Any]] = {}
+        for r in flagged:
+            key = r["release"]
+            if key not in best or abs(r["z"]) > abs(best[key]["z"]):
+                best[key] = r
+        print(f"\n--- {len(best)} important releases in this window ---")
+        for r in sorted(best.values(), key=lambda x: (-int(x.get("importance") or 0),
+                                                      -abs(x["z"]))):
+            star = "***" if int(r.get("importance") or 0) >= 3 else " **"
+            print(f"  {star} {r['z']:+6.2f}sd  {r['region']:<3} "
+                  f"{str(r['release_description'])[:46]:<46} {r['verdict']}")
+
     print(f"\n--- top {min(top, len(payload['rows']))} by |z| ---")
     for r in payload["rows"][:top]:
-        print(f"  {r['z']:+6.2f}sd  {r['region']:<3} {r['description'][:60]:<60} "
+        mark = "*" if int(r.get("importance") or 0) >= 2 else " "
+        print(f" {mark}{r['z']:+6.2f}sd  {r['region']:<3} {r['description'][:58]:<58} "
               f"{r['latest']:>12}  ({r['scored_on']})")
 
 
@@ -1536,6 +1662,8 @@ tr.m .z{color:var(--m);} tr.l .z{color:var(--l);}
 .kv b{color:var(--fg);font-weight:600;}
 .note{color:var(--dim);font-size:12px;margin-top:10px;max-width:85ch;}
 .empty{color:var(--dim);padding:22px 8px;text-align:center;}
+.star{color:var(--m);letter-spacing:-1px;font-size:11px;vertical-align:1px;}
+tr.row.imp td:first-child{box-shadow:inset 3px 0 0 var(--m);}
 details summary{cursor:pointer;color:var(--dim);font-size:12px;
 text-transform:uppercase;letter-spacing:.08em;font-weight:600;}
 #drop{border:2px dashed var(--line);border-radius:10px;padding:40px 20px;text-align:center;
@@ -1578,9 +1706,15 @@ color:var(--dim);transition:border-color .15s,background .15s;}
       <option value="time">Sort by release time</option>
     </select>
     <select id="day"><option value="">All dates</option></select>
+    <select id="imp">
+      <option value="0">All releases</option>
+      <option value="2">Important only</option>
+      <option value="3">Top importance only</option>
+    </select>
     <span class="lab">Min |z| <b id="zval">0.0</b></span>
     <input type="range" id="zmin" min="0" max="4" step="0.25" value="0">
     <button id="limit" class="on">Top <span id="limn">50</span></button>
+    <button id="keepimp" class="on" title="Important releases stay visible even when they fall outside the top N">Keep important</button>
     <span class="lab" id="count"></span>
   </div>
   <div class="chips" id="regions"></div>
@@ -1619,7 +1753,10 @@ color:var(--dim);transition:border-color .15s,background .15s;}
 (function(){
 var rows = [], rels = [], meta = {};
 var state = {q:'', zmin:0, sort:'abs_z', regions:new Set(), limit:true,
-             sortKey:null, sortDir:-1, day:'', top:50};
+             sortKey:null, sortDir:-1, day:'', top:50, imp:0, keepImp:true};
+
+function impOf(r){ var v = parseInt(r.importance,10); return isNaN(v)?0:v; }
+function stars(n){ return n>=3?'★★★':n>=2?'★★':n>=1?'★':''; }
 
 function esc(s){ return String(s==null?'':s)
   .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
@@ -1809,6 +1946,7 @@ function afterLoad(reports){
 function filtered(){
   var q=state.q.toLowerCase();
   var out=rows.filter(function(r){
+    if(state.imp && impOf(r) < state.imp) return false;
     if(Math.abs(r.z) < state.zmin) return false;
     if(state.day && r.release_date !== state.day) return false;
     if(state.regions.size && !state.regions.has(r.region)) return false;
@@ -1845,10 +1983,26 @@ function filtered(){
 
 function draw(){
   var all=filtered();
-  var show=state.limit? all.slice(0,state.top) : all;
+  var show=all, added=0;
+  if(state.limit){
+    show = all.slice(0, state.top);
+    if(state.keepImp){
+      // An important release that lands outside the top N is exactly the case
+      // this is for: unremarkable print, still worth seeing. Append rather
+      // than drop, keeping the original sort order among the extras.
+      var seen = {};
+      show.forEach(function(r){ seen[r.series+'|'+r.release_date]=1; });
+      var extra = all.filter(function(r){
+        return impOf(r) >= 2 && !seen[r.series+'|'+r.release_date];
+      });
+      added = extra.length;
+      show = show.concat(extra);
+    }
+  }
   document.getElementById('count').textContent =
     'showing '+show.length+' of '+all.length+
-    (all.length!==rows.length? ' ('+rows.length+' total)':'');
+    (added? ' (incl. '+added+' important below the cut)':'')+
+    (all.length!==rows.length? ' · '+rows.length+' total':'');
   var tb=document.getElementById('tb');
   if(!show.length){
     tb.innerHTML='<tr><td colspan="9" class="empty">Nothing matches these filters.</td></tr>';
@@ -1856,10 +2010,13 @@ function draw(){
   }
   var html='';
   show.forEach(function(r,i){
-    html += '<tr class="row '+band(r.z)+'" data-i="'+i+'">'
+    html += '<tr class="row '+band(r.z)+(impOf(r)>=2?' imp':'')+'" data-i="'+i+'">'
       + '<td class="z">'+(r.z>0?'+':'')+Number(r.z).toFixed(2)+'</td>'
       + '<td class="reg">'+esc(String(r.region).toUpperCase())+'</td>'
-      + '<td class="desc">'+esc(r.description)
+      + '<td class="desc">'
+      + (impOf(r)>=1? '<span class="star" title="Macrobond importance: '
+          + esc(r.importance_label||impOf(r)) + '">'+stars(impOf(r))+'</span> ' : '')
+      + esc(r.description)
       + '<span class="sub">'+esc(r.release_description)
       + (r.release_date? ' · '+esc(r.release_date):'')
       + (r.event_time_local? ' '+esc(String(r.event_time_local).split(' ').pop()):'')
@@ -1936,6 +2093,10 @@ document.getElementById('q').oninput=function(e){ state.q=e.target.value; draw()
 document.getElementById('sort').onchange=function(e){
   state.sort=e.target.value; state.sortKey=null; markSort(); draw(); };
 document.getElementById('day').onchange=function(e){ state.day=e.target.value; draw(); };
+document.getElementById('imp').onchange=function(e){
+  state.imp=parseInt(e.target.value,10)||0; draw(); };
+document.getElementById('keepimp').onclick=function(){
+  state.keepImp=!state.keepImp; this.classList.toggle('on',state.keepImp); draw(); };
 document.getElementById('zmin').oninput=function(e){
   state.zmin=parseFloat(e.target.value);
   document.getElementById('zval').textContent=state.zmin.toFixed(1); draw(); };
@@ -2693,6 +2854,49 @@ def run_selftest() -> int:
         {"Name": "r3", "Description": "D3", "Region": "de",
          "LastReleaseEventTime": "2026-08-20T09:00:00Z"},
     ]
+    # 9g1. importance normalisation
+    check("word importance mapped", normalise_importance({"Importance": "High"})[0] == 3)
+    check("medium mapped", normalise_importance({"Impact": "Medium"})[0] == 2)
+    check("low mapped", normalise_importance({"Priority": "low"})[0] == 1)
+    check("boolean true mapped", normalise_importance({"IsImportant": "true"})[0] == 3)
+    check("boolean false mapped", normalise_importance({"IsImportant": "false"})[0] == 0)
+    check("1-3 rank kept", normalise_importance({"Importance": 3})[0] == 3)
+    check("1-3 rank low kept", normalise_importance({"Importance": 1})[0] == 1)
+    check("0-100 score bucketed high", normalise_importance({"Importance": 90})[0] == 3)
+    check("0-100 score bucketed medium", normalise_importance({"Importance": 50})[0] == 2)
+    check("0-100 score bucketed low", normalise_importance({"Importance": 10})[0] == 1)
+    check("star rating mapped", normalise_importance({"Importance": "***"})[0] == 3)
+    check("absent means zero, not unimportant",
+          normalise_importance({"Region": "us"}) == (0, ""))
+    check("unrecognised word still counts as flagged",
+          normalise_importance({"Importance": "Hoch"})[0] == 2)
+    check("explicit attribute override wins",
+          normalise_importance({"Foo": "high", "Importance": "low"}, "Foo")[0] == 3)
+    check("raw value is preserved for audit",
+          normalise_importance({"Importance": "High"})[1] == "High")
+
+    yesterday = date.today() - timedelta(days=1)
+    tomorrow = date.today() + timedelta(days=1)
+    ys = yesterday.strftime("%Y-%m-%dT09:00:00Z")
+    ts = tomorrow.strftime("%Y-%m-%dT09:00:00Z")
+
+    imp_ents = [{"Name": "big", "Description": "US CPI", "Region": "us",
+                 "Importance": "High", "NextReleaseEventTime": ys},
+                {"Name": "small", "Description": "Minor survey", "Region": "us",
+                 "Importance": "Low", "NextReleaseEventTime": ys}]
+    got = releases_in_range(imp_ents, yesterday, yesterday, 0.0)
+    check("importance carried onto the release row",
+          {h["release"]: h["importance"] for h in got} == {"big": 3, "small": 1},
+          f"got { {h['release']: h['importance'] for h in got} }")
+    check("importance label set", any(h["importance_label"] == "high" for h in got))
+    check("importance is in the CSV header", "importance" in CSV_FIELDS)
+    check("importance is in the calendar header", "importance" in CALENDAR_FIELDS)
+
+    viewer_txt = render_viewer()
+    check("viewer has an importance filter", 'id="imp"' in viewer_txt)
+    check("viewer has a keep-important toggle", 'id="keepimp"' in viewer_txt)
+    check("viewer marks important rows", "stars(" in viewer_txt)
+
     # 9g2. status must come from the clock, not from which attribute holds the
     # timestamp. The bug this pins: with no LastReleaseEventTime anywhere,
     # every release looked Upcoming for ever and nothing was ever scored.
@@ -2853,6 +3057,13 @@ def main() -> int:
                     help="how long to trust cached release membership")
     ap.add_argument("--full-download", action="store_true",
                     help="disable the NotModified path and re-download everything")
+    ap.add_argument("--min-importance", type=int, default=0, choices=[0, 1, 2, 3],
+                    help="only scan releases at least this important. 0 scans "
+                         "everything, which is the default: importance is used to "
+                         "surface releases, not to discard them")
+    ap.add_argument("--importance-attr", default="",
+                    help="name of the Macrobond importance attribute, if you know it. "
+                         "Otherwise a list of likely names is tried")
     ap.add_argument("--kind", default="economic", choices=["economic", "company", "all"],
                     help="economic releases only by default, company earnings excluded")
     ap.add_argument("--must-have", default="",
