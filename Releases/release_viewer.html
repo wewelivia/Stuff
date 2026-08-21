@@ -46,7 +46,7 @@ tr.m .z{color:var(--m);} tr.l .z{color:var(--l);}
 .num{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap;}
 .reg{color:var(--dim);font-weight:600;width:48px;}
 .dt,.sp{color:var(--dim);white-space:nowrap;font-size:12px;}
-.desc .sub{display:block;color:var(--dim);font-size:11px;margin-top:2px;}
+.desc .sub{display:block;color:var(--dim);font-size:11px;margin-top:2px;font-weight:400;}
 .detail td{background:rgba(127,127,127,.05);font-size:13px;}
 .about{margin:0 0 10px;max-width:80ch;}
 .kv{display:flex;gap:26px;flex-wrap:wrap;color:var(--dim);font-size:12px;}
@@ -59,6 +59,9 @@ tr.grp>td{border-bottom:1px solid var(--line);}
 font-size:10px;font-weight:700;text-align:center;color:#0f1115;}
 .pip.x{background:var(--x);} .pip.h{background:var(--h);} .pip.m{background:var(--m);}
 .alert{color:var(--h);}
+.widest{color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:.05em;}
+.sep{color:var(--dim);}
+tr.grp>td.desc{font-weight:600;}
 td.nested{padding:0 0 0 26px;background:rgba(127,127,127,.045);}
 table.inner{width:100%;border-collapse:collapse;}
 table.inner td{border-bottom:1px solid var(--line);}
@@ -179,9 +182,29 @@ function groupRows(list){
       if(a > g.maxAbs){ g.maxAbs = a; g.worst = r; }
       if(a >= 3) g.counts.x++; else if(a >= 2) g.counts.h++; else if(a >= 1.25) g.counts.m++;
     });
-    // does anything other than the headline move?
+
+    // Only treat a member as the release's headline if it actually carries
+    // aggregate wording. Plenty of releases have no aggregate at all: an
+    // Irish wholesale price release is a list of commodities, and picking the
+    // shortest name off it produced a row titled "Glass".
+    g.trueHeadline = null;
+    for(var i=0;i<g.members.length;i++){
+      if(parseInt(g.members[i].tier,10) === 0){ g.trueHeadline = g.members[i]; break; }
+    }
+    g.lead = g.trueHeadline || g.worst;
+    g.leadIsAggregate = !!g.trueHeadline;
+
+    // With no aggregate to anchor on, rank order is arbitrary, so show the
+    // members by how much they moved instead.
+    if(!g.trueHeadline){
+      g.members.sort(function(a,b){ return Math.abs(b.z) - Math.abs(a.z); });
+    }
+
+    // does anything other than the lead move?
     g.subMax = 0;
-    g.rest.forEach(function(r){ g.subMax = Math.max(g.subMax, Math.abs(r.z)); });
+    g.members.forEach(function(r){
+      if(r !== g.lead) g.subMax = Math.max(g.subMax, Math.abs(r.z));
+    });
     return g;
   });
 }
@@ -419,6 +442,17 @@ function filtered(){
   return out;
 }
 
+// A bare component name is useless on its own: "Glass" means nothing without
+// "Wholesale Price Index" attached. Qualify it, unless the series description
+// already repeats the release wording.
+function qualified(r){
+  var d = String(r.description||''), rel = String(r.release_description||'');
+  if(!rel) return esc(d);
+  var dl = d.toLowerCase(), rl = rel.toLowerCase();
+  if(dl.indexOf(rl) !== -1 || rl.indexOf(dl) !== -1) return esc(d);
+  return esc(rel) + '<span class="sep"> · </span>' + esc(d);
+}
+
 function memberCells(r, cls){
   return '<td class="z">'+(r.z>0?'+':'')+Number(r.z).toFixed(2)+'</td>'
     + '<td class="reg">'+esc(String(r.region).toUpperCase())+'</td>'
@@ -467,17 +501,22 @@ function drawGrouped(all){
     return;
   }
   show.forEach(function(g, gi){
-    var h = g.headline, opened = !!state.open[g.key];
-    var flag = g.subMax >= 2 && Math.abs(h.z) < 2;
-    html += '<tr class="row grp '+band(g.maxAbs>=Math.abs(h.z)?g.worst.z:h.z)
-      + '" data-g="'+gi+'">'
+    var h = g.lead, opened = !!state.open[g.key];
+    var flag = g.leadIsAggregate && g.subMax >= 2 && Math.abs(h.z) < 2;
+    // The group is the release, so the release names the row. The series the
+    // number belongs to goes underneath, because "Glass" on its own says
+    // nothing without "Wholesale Price Index" above it.
+    html += '<tr class="row grp '+band(g.worst.z)+'" data-g="'+gi+'">'
       + '<td class="z">'+(h.z>0?'+':'')+Number(h.z).toFixed(2)+'</td>'
       + '<td class="reg">'+esc(String(g.region).toUpperCase())+'</td>'
       + '<td class="desc"><span class="tw">'+(opened?'▾':'▸')+'</span> '
-      + esc(h.description)
-      + '<span class="sub">'+esc(g.desc)
+      + esc(g.desc || h.description)
+      + '<span class="sub">'
+      + (g.leadIsAggregate ? esc(h.description)
+                           : '<span class="widest">widest of '+g.members.length
+                             +':</span> '+esc(h.description))
       + (g.date? ' · '+esc(g.date):'')
-      + (g.members.length>1? ' · '+g.members.length+' series':'')
+      + (g.members.length>1 && g.leadIsAggregate? ' · '+g.members.length+' series':'')
       + (flag? ' · <b class="alert">subcomponent '
           + (g.worst.z>0?'+':'') + Number(g.worst.z).toFixed(1) + ' sd</b>' : '')
       + '</span></td>'
@@ -538,7 +577,7 @@ function draw(){
     html += '<tr class="row '+band(r.z)+'" data-i="'+i+'">'
       + '<td class="z">'+(r.z>0?'+':'')+Number(r.z).toFixed(2)+'</td>'
       + '<td class="reg">'+esc(String(r.region).toUpperCase())+'</td>'
-      + '<td class="desc">'+esc(r.description)
+      + '<td class="desc">'+qualified(r)
       + '<span class="sub">'+esc(r.release_description)
       + (r.release_date? ' · '+esc(r.release_date):'')
       + (r.event_time_local? ' '+esc(String(r.event_time_local).split(' ').pop()):'')
