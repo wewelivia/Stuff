@@ -100,8 +100,26 @@ HEADLINE_HINTS = (
     "total", "all items", "headline", "overall", "aggregate", "economy",
     "composite", "whole economy", "national", "seasonally adjusted",
 )
+
+# Sub-indices that are frequently the point of the release. Core inflation and
+# PMI output prices are not "detail", they are often the number that moves the
+# market, so they are promoted above the plain headline rather than discarded.
+PRIORITY_HINTS = (
+    "core", "excluding food and energy", "ex food and energy",
+    "excluding energy", "excluding fuel", "underlying",
+    "new orders", "new export orders", "output prices", "input prices",
+    "prices paid", "prices received", "prices charged",
+    "employment", "expectations", "future output", "backlogs",
+    "inventories", "stocks of finished goods", "delivery times",
+    "trimmed mean", "median",
+)
+
+# Genuine detail: geographic splits and decompositions that multiply row counts
+# without adding a distinct signal. Note "excluding" is deliberately absent, it
+# was demoting core inflation below food and energy.
 COMPONENT_PENALTY = (
-    "by region", "by state", "by county", "by province", "excluding",
+    "by region", "by state", "by county", "by province", "by district",
+    "by industry", "by age", "by sex", "by size",
     "detail", "sub-", "breakdown", "of which", "contribution",
 )
 
@@ -181,7 +199,9 @@ FREQ_ALIASES = {
 MIN_OBS_FOR_SCORE = 24          # legacy floor, superseded by FREQ_CONFIG[..]["min"]
 TRAILING_WINDOW = 60            # legacy window, superseded by FREQ_CONFIG[..]["window"]
 TREND_TEST_RATIO = 0.35         # |mean(diff)| > ratio * sd(diff) => trending
-DEFAULT_MAX_SERIES_PER_RELEASE = 5
+# Enough to carry a release's headline plus its main sub-indices. A PMI has
+# around a dozen that matter; five was cutting into them.
+DEFAULT_MAX_SERIES_PER_RELEASE = 12
 DEFAULT_MAX_RELEASES = 400
 
 CACHE_FILENAME = "macrobond_release_cache.json"
@@ -959,6 +979,62 @@ def resolve_dates(args) -> Tuple[date, date]:
     return start, end
 
 
+TIER_HEADLINE, TIER_PRIORITY, TIER_OTHER, TIER_DETAIL = 0, 1, 2, 3
+
+
+def tier_member_series(description: str) -> int:
+    """
+    Which band a member series falls into. Lower is kept first.
+
+    Tiers rather than a numeric bonus, because a flat bonus large enough to
+    rescue core CPI from the bottom was also large enough to push PMI New
+    Orders above the headline PMI itself.
+    """
+    desc = description.lower()
+    if any(p in desc for p in COMPONENT_PENALTY):
+        return TIER_DETAIL
+    if any(h in desc for h in HEADLINE_HINTS):
+        return TIER_HEADLINE
+    if any(h in desc for h in PRIORITY_HINTS):
+        return TIER_PRIORITY
+    return TIER_OTHER
+
+
+def rank_member_series(entities: Iterable[Any],
+                       regions: Optional[List[str]] = None) -> List[str]:
+    """
+    Member series names, most interesting first.
+
+    Order is headline, then the sub-indices that carry information in their own
+    right, then everything else, then decompositions. Within a tier, the terser
+    description wins, since an aggregate is usually described more briefly than
+    a breakdown of it.
+    """
+    items: List[Tuple[int, int, str, str]] = []
+    for ent in entities:
+        name = _entity_name(ent)
+        if not name:
+            continue
+        region = (_meta(ent, "Region") or "").lower()
+        if regions and region and region not in regions:
+            continue
+        desc = str(_meta(ent, "Description") or name)
+        items.append((tier_member_series(desc), len(desc), desc.lower(), name))
+
+    # Where nothing carries explicit headline wording, the tersest non-detail
+    # entry is the headline: "Manufacturing PMI" has no give-away hint in it.
+    # Only as a fallback though, or "Consumer Price Index, Food" wins the slot
+    # simply by being shorter than "Consumer Price Index, All Items".
+    if not any(i[0] == TIER_HEADLINE for i in items):
+        candidates = [i for i in items if i[0] != TIER_DETAIL]
+        if candidates:
+            shortest = min(candidates, key=lambda i: (i[1], i[2]))
+            items = [(-1, i[1], i[2], i[3]) if i is shortest else i for i in items]
+
+    items.sort()
+    return [n for _, _, _, n in items]
+
+
 def series_for_release(api, release_name: str, regions: Optional[List[str]], limit: int,
                        cache: Optional["Cache"] = None,
                        ttl_days: float = 7.0) -> List[str]:
@@ -987,24 +1063,7 @@ def series_for_release(api, release_name: str, regions: Optional[List[str]], lim
         except Exception:
             return []
 
-    scored: List[Tuple[float, str]] = []
-    for ent in entities:
-        name = _entity_name(ent)
-        if not name:
-            continue
-        region = (_meta(ent, "Region") or "").lower()
-        if regions and region and region not in regions:
-            continue
-        desc = str(_meta(ent, "Description") or name).lower()
-        rank = float(len(desc))
-        if any(h in desc for h in HEADLINE_HINTS):
-            rank -= 40.0
-        if any(p in desc for p in COMPONENT_PENALTY):
-            rank += 60.0
-        scored.append((rank, name))
-
-    scored.sort()
-    ranked = [n for _, n in scored]
+    ranked = rank_member_series(entities, regions)
     if cache is not None:
         # cache the full ranked list so raising --max-series-per-release later
         # does not force a re-search
@@ -1397,7 +1456,7 @@ def run_scan(args) -> Dict[str, Any]:
     print("\n[4/4] scoring")
     rows: List[Dict[str, Any]] = []
     for rel in to_score:
-        for name in release_series.get(rel["release"], []):
+        for member_rank, name in enumerate(release_series.get(rel["release"], [])):
             s = loaded.get(name)
             if s is None:
                 continue
@@ -1419,6 +1478,8 @@ def run_scan(args) -> Dict[str, Any]:
                 "event_time_local": rel["event_time_local"].strftime("%Y-%m-%d %H:%M") if rel["event_time_local"] else "",
                 "series": name,
                 "description": _meta(s, "Description") or name,
+                "member_rank": member_rank,
+                "tier": tier_member_series(str(_meta(s, "Description") or name)),
                 "about": describe_series(s, rel["region"], rel["description"]),
                 "source": _meta(s, "Source") or "",
                 "unit": _meta(s, "DisplayUnit") or _meta(s, "Unit") or "",
@@ -1465,7 +1526,7 @@ CSV_FIELDS = [
     "event_time_local", "series", "description", "about", "source", "unit",
     "frequency", "obs_date", "latest", "previous", "scored_on", "z", "abs_z",
     "trend_break", "pctile", "n_obs", "window_obs", "window_years",
-    "scale_kind", "verdict",
+    "scale_kind", "member_rank", "tier", "verdict",
 ]
 
 # Calendar rows go to their own CSV so the viewer can show releases that
@@ -1493,6 +1554,46 @@ def output_paths(payload: Dict[str, Any], outdir: str, flat: bool) -> Tuple[str,
     return os.path.join(outdir, year, month), stem
 
 
+def _read_existing_csv(path: str) -> List[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, newline="", encoding="utf-8") as fh:
+            return list(csv.DictReader(fh))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  could not read the existing {os.path.basename(path)}: {exc}")
+        return []
+
+
+def merge_rows(existing: List[Dict[str, Any]], new: List[Dict[str, Any]],
+               key_fields: Sequence[str]) -> Tuple[List[Dict[str, Any]], int, int]:
+    """
+    Union two sets of rows, with the newer one winning on collisions.
+
+    Needed because a second run on the same day only downloads what changed
+    since the first, by design. Without merging, that second run overwrites a
+    full morning file with the handful of afternoon revisions.
+
+    Returns (rows, count carried over from the old file, count new or updated).
+    """
+    def key(row: Dict[str, Any]) -> Tuple[str, ...]:
+        return tuple(str(row.get(k, "")) for k in key_fields)
+
+    merged: Dict[Tuple[str, ...], Dict[str, Any]] = {key(r): r for r in existing}
+    before = len(merged)
+    replaced = sum(1 for row in new if key(row) in merged)
+    for row in new:
+        merged[key(row)] = row
+    return list(merged.values()), before - replaced, len(new)
+
+
+def _sort_key_abs_z(row: Dict[str, Any]) -> float:
+    value = _safe_float(row.get("abs_z"))
+    if value is None:
+        value = abs(_safe_float(row.get("z")) or 0.0)
+    return -value
+
+
 def write_outputs(payload: Dict[str, Any], args, top: int = 50) -> None:
     outdir = args.outdir
     folder, stem = output_paths(payload, outdir, getattr(args, "flat", False))
@@ -1500,29 +1601,51 @@ def write_outputs(payload: Dict[str, Any], args, top: int = 50) -> None:
 
     written: List[str] = []
 
+    merge = not getattr(args, "overwrite", False)
+
     csv_path = os.path.join(folder, stem + ".csv")
+    rows = list(payload["rows"])
+    if merge:
+        prior = _read_existing_csv(csv_path)
+        if prior:
+            rows, carried, fresh = merge_rows(prior, rows, ("series", "release_date"))
+            print(f"  merging with the existing file: {carried} rows carried over, "
+                  f"{fresh} new or updated, {len(rows)} total")
+    rows.sort(key=_sort_key_abs_z)
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(payload["rows"])
+        writer.writerows(rows)
     written.append(csv_path)
 
     cal_path = os.path.join(folder, stem + "_calendar.csv")
+    cal_rows = []
+    for rel in payload["releases"]:
+        row = dict(rel)
+        local = row.get("event_time_local")
+        row["event_time_local"] = (local.strftime("%Y-%m-%d %H:%M")
+                                   if isinstance(local, datetime) else (local or ""))
+        cal_rows.append(row)
+    if merge:
+        prior_cal = _read_existing_csv(cal_path)
+        if prior_cal:
+            cal_rows, _, _ = merge_rows(prior_cal, cal_rows, ("release", "release_date"))
+    cal_rows.sort(key=lambda r: (str(r.get("release_date", "")),
+                                 str(r.get("event_time_local", ""))))
     with open(cal_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CALENDAR_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        for rel in payload["releases"]:
-            row = dict(rel)
-            local = row.get("event_time_local")
-            row["event_time_local"] = (local.strftime("%Y-%m-%d %H:%M")
-                                       if isinstance(local, datetime) else (local or ""))
-            writer.writerow(row)
+        writer.writerows(cal_rows)
     written.append(cal_path)
 
     if not getattr(args, "no_json", False):
         json_path = os.path.join(folder, stem + ".json")
+        # write the merged view without mutating the caller's payload
+        merged_payload = dict(payload)
+        merged_payload["rows"] = rows
+        merged_payload["releases"] = cal_rows
         with open(json_path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, default=str)
+            json.dump(merged_payload, fh, indent=2, default=str)
         written.append(json_path)
 
     # The viewer is a fixed template that loads a CSV, so it is written once at
@@ -1615,6 +1738,17 @@ tr.m .z{color:var(--m);} tr.l .z{color:var(--l);}
 .kv b{color:var(--fg);font-weight:600;}
 .note{color:var(--dim);font-size:12px;margin-top:10px;max-width:85ch;}
 .empty{color:var(--dim);padding:22px 8px;text-align:center;}
+.tw{display:inline-block;width:12px;color:var(--dim);font-size:10px;}
+tr.grp>td{border-bottom:1px solid var(--line);}
+.pip{display:inline-block;min-width:16px;padding:1px 4px;margin-right:3px;border-radius:8px;
+font-size:10px;font-weight:700;text-align:center;color:#0f1115;}
+.pip.x{background:var(--x);} .pip.h{background:var(--h);} .pip.m{background:var(--m);}
+.alert{color:var(--h);}
+td.nested{padding:0 0 0 26px;background:rgba(127,127,127,.045);}
+table.inner{width:100%;border-collapse:collapse;}
+table.inner td{border-bottom:1px solid var(--line);}
+table.inner tr:last-child td{border-bottom:none;}
+.desc.head{font-weight:600;}
 details summary{cursor:pointer;color:var(--dim);font-size:12px;
 text-transform:uppercase;letter-spacing:.08em;font-weight:600;}
 #drop{border:2px dashed var(--line);border-radius:10px;padding:40px 20px;text-align:center;
@@ -1659,6 +1793,7 @@ color:var(--dim);transition:border-color .15s,background .15s;}
     <select id="day"><option value="">All dates</option></select>
     <span class="lab">Min |z| <b id="zval">0.0</b></span>
     <input type="range" id="zmin" min="0" max="4" step="0.25" value="0">
+    <button id="group" class="on">Group by release</button>
     <button id="limit" class="on">Top <span id="limn">50</span></button>
     <span class="lab" id="count"></span>
   </div>
@@ -1698,7 +1833,54 @@ color:var(--dim);transition:border-color .15s,background .15s;}
 (function(){
 var rows = [], rels = [], meta = {};
 var state = {q:'', zmin:0, sort:'abs_z', regions:new Set(), limit:true,
-             sortKey:null, sortDir:-1, day:'', top:50};
+             sortKey:null, sortDir:-1, day:'', top:50, group:true, open:{}};
+
+// ---- grouping -----------------------------------------------------------
+// One row per release, carrying the headline reading, with a signal when a
+// subcomponent moved. A dull headline over a violent sub-index is exactly the
+// case a flat list buries, because the group sorts on its worst member.
+function groupRows(list){
+  var byKey = {}, order = [];
+  list.forEach(function(r){
+    var k = r.release + '|' + (r.release_date || '');
+    if(!byKey[k]){ byKey[k] = {key:k, release:r.release, date:r.release_date,
+                               region:r.region, desc:r.release_description,
+                               time:r.event_time_local, members:[]}; order.push(k); }
+    byKey[k].members.push(r);
+  });
+  return order.map(function(k){
+    var g = byKey[k];
+    g.members.sort(function(a,b){
+      var ra = parseInt(a.member_rank,10), rb = parseInt(b.member_rank,10);
+      if(!isNaN(ra) && !isNaN(rb) && ra !== rb) return ra - rb;
+      return String(a.description).length - String(b.description).length;
+    });
+    g.headline = g.members[0];
+    g.rest = g.members.slice(1);
+    g.maxAbs = 0; g.worst = g.headline;
+    g.counts = {x:0, h:0, m:0};
+    g.members.forEach(function(r){
+      var a = Math.abs(r.z);
+      if(a > g.maxAbs){ g.maxAbs = a; g.worst = r; }
+      if(a >= 3) g.counts.x++; else if(a >= 2) g.counts.h++; else if(a >= 1.25) g.counts.m++;
+    });
+    // does anything other than the headline move?
+    g.subMax = 0;
+    g.rest.forEach(function(r){ g.subMax = Math.max(g.subMax, Math.abs(r.z)); });
+    return g;
+  });
+}
+
+function pips(g){
+  var out = '';
+  if(g.counts.x) out += '<span class="pip x" title="'+g.counts.x+' at 3 sd or more">'
+    + g.counts.x + '</span>';
+  if(g.counts.h) out += '<span class="pip h" title="'+g.counts.h+' at 2 sd or more">'
+    + g.counts.h + '</span>';
+  if(g.counts.m) out += '<span class="pip m" title="'+g.counts.m+' at 1.25 sd or more">'
+    + g.counts.m + '</span>';
+  return out;
+}
 
 function esc(s){ return String(s==null?'':s)
   .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
@@ -1922,8 +2104,111 @@ function filtered(){
   return out;
 }
 
+function memberCells(r, cls){
+  return '<td class="z">'+(r.z>0?'+':'')+Number(r.z).toFixed(2)+'</td>'
+    + '<td class="reg">'+esc(String(r.region).toUpperCase())+'</td>'
+    + '<td class="desc '+cls+'">'+esc(r.description)+'</td>'
+    + '<td class="num">'+esc(r.latest)+'</td>'
+    + '<td class="num">'+esc(r.previous)+'</td>'
+    + '<td class="num">'+(r.trend_break>0?'+':'')+Number(r.trend_break).toFixed(2)+'</td>'
+    + '<td class="num">'+Number(r.pctile).toFixed(0)+'</td>'
+    + '<td class="sp">'+esc(r.scored_on)+'</td>'
+    + '<td class="dt">'+esc(r.obs_date)+'</td>';
+}
+
+function detailRow(r, id){
+  return '<tr class="detail" id="'+id+'" style="display:none"><td colspan="9">'
+    + '<p class="about">'+esc(r.about||r.description)+'</p>'
+    + '<div class="kv">'
+    + '<span>Verdict <b>'+esc(r.verdict)+'</b></span>'
+    + '<span>Code <b>'+esc(r.series)+'</b></span>'
+    + (r.unit?'<span>Unit <b>'+esc(r.unit)+'</b></span>':'')
+    + (r.frequency?'<span>Frequency <b>'+esc(r.frequency)+'</b></span>':'')
+    + (r.source?'<span>Source <b>'+esc(r.source)+'</b></span>':'')
+    + '<span>History <b>'+esc(r.n_obs)+' obs</b></span>'
+    + (r.window_obs?'<span>Benchmark <b>'+esc(r.window_obs)+' obs / '
+       + esc(r.window_years)+' yrs</b></span>':'')
+    + (r.scale_kind?'<span>Scale <b>'+esc(r.scale_kind)+'</b></span>':'')
+    + '<span>Status <b>'+esc(r.status)+'</b></span>'
+    + '</div></td></tr>';
+}
+
+function drawGrouped(all){
+  var groups = groupRows(all);
+  groups.sort(function(a,b){
+    if(state.sortKey || state.sort!=='abs_z'){
+      // fall back to the headline's own ordering under an explicit sort
+      return Math.abs(b.headline.z) - Math.abs(a.headline.z);
+    }
+    return b.maxAbs - a.maxAbs;      // a group is as interesting as its worst member
+  });
+  var show = state.limit ? groups.slice(0, state.top) : groups;
+  document.getElementById('count').textContent =
+    'showing '+show.length+' of '+groups.length+' releases · '+all.length+' series';
+
+  var tb = document.getElementById('tb'), html='';
+  if(!show.length){
+    tb.innerHTML='<tr><td colspan="9" class="empty">Nothing matches these filters.</td></tr>';
+    return;
+  }
+  show.forEach(function(g, gi){
+    var h = g.headline, opened = !!state.open[g.key];
+    var flag = g.subMax >= 2 && Math.abs(h.z) < 2;
+    html += '<tr class="row grp '+band(g.maxAbs>=Math.abs(h.z)?g.worst.z:h.z)
+      + '" data-g="'+gi+'">'
+      + '<td class="z">'+(h.z>0?'+':'')+Number(h.z).toFixed(2)+'</td>'
+      + '<td class="reg">'+esc(String(g.region).toUpperCase())+'</td>'
+      + '<td class="desc"><span class="tw">'+(opened?'▾':'▸')+'</span> '
+      + esc(h.description)
+      + '<span class="sub">'+esc(g.desc)
+      + (g.date? ' · '+esc(g.date):'')
+      + (g.members.length>1? ' · '+g.members.length+' series':'')
+      + (flag? ' · <b class="alert">subcomponent '
+          + (g.worst.z>0?'+':'') + Number(g.worst.z).toFixed(1) + ' sd</b>' : '')
+      + '</span></td>'
+      + '<td class="num">'+esc(h.latest)+'</td>'
+      + '<td class="num">'+esc(h.previous)+'</td>'
+      + '<td class="num">'+(h.trend_break>0?'+':'')+Number(h.trend_break).toFixed(2)+'</td>'
+      + '<td class="num">'+Number(h.pctile).toFixed(0)+'</td>'
+      + '<td class="sp">'+pips(g)+'</td>'
+      + '<td class="dt">'+esc(h.obs_date)+'</td></tr>';
+
+    var style = opened ? '' : ' style="display:none"';
+    html += '<tr class="member" data-grp="'+gi+'"'+style+'>'
+      + '<td colspan="9" class="nested"><table class="inner">';
+    g.members.forEach(function(r, mi){
+      html += '<tr class="row '+band(r.z)+'" data-i="'+gi+'_'+mi+'">'
+        + memberCells(r, mi===0 ? 'head' : '') + '</tr>'
+        + detailRow(r, 'd'+gi+'_'+mi);
+    });
+    html += '</table></td></tr>';
+  });
+  tb.innerHTML = html;
+
+  Array.prototype.forEach.call(tb.querySelectorAll('tr.grp'), function(tr){
+    tr.onclick = function(){
+      var gi = tr.getAttribute('data-g');
+      var key = show[parseInt(gi,10)].key;
+      state.open[key] = !state.open[key];
+      var body = tb.querySelector('tr.member[data-grp="'+gi+'"]');
+      if(body) body.style.display = state.open[key] ? 'table-row' : 'none';
+      var tw = tr.querySelector('.tw');
+      if(tw) tw.textContent = state.open[key] ? '▾' : '▸';
+    };
+  });
+  Array.prototype.forEach.call(tb.querySelectorAll('tr.inner, table.inner tr.row'),
+    function(tr){
+      tr.onclick = function(e){
+        e.stopPropagation();
+        var d = document.getElementById('d'+tr.getAttribute('data-i'));
+        if(d) d.style.display = d.style.display==='none' ? 'table-row' : 'none';
+      };
+    });
+}
+
 function draw(){
   var all=filtered();
+  if(state.group){ drawGrouped(all); return; }
   var show = state.limit ? all.slice(0, state.top) : all;
   document.getElementById('count').textContent =
     'showing '+show.length+' of '+all.length+
@@ -2021,6 +2306,8 @@ document.getElementById('zmin').oninput=function(e){
 document.getElementById('limit').onclick=function(){
   state.limit=!state.limit; this.classList.toggle('on',state.limit);
   this.firstChild.textContent = state.limit?'Top ':'Show all '; draw(); };
+document.getElementById('group').onclick=function(){
+  state.group=!state.group; this.classList.toggle('on',state.group); draw(); };
 
 function markSort(){
   Array.prototype.forEach.call(document.querySelectorAll('th .ar'),function(a){a.textContent='';});
@@ -2865,6 +3152,94 @@ def run_selftest() -> int:
     check("single-day wrapper still works",
           len(releases_on_day(range_ents, date(2026, 8, 14), 0.0)) == 1)
 
+    # 9h00. member series ranking. The bug this pins: core CPI ranked last of
+    # seven, below Food and Energy, because "excluding" was treated as detail.
+    cpi_members = [
+        {"Name": "c1", "Description": "Consumer Price Index, All Items"},
+        {"Name": "c2", "Description": "Consumer Price Index, All Items Excluding Food and Energy"},
+        {"Name": "c3", "Description": "Consumer Price Index, Food"},
+        {"Name": "c4", "Description": "Consumer Price Index, Energy"},
+        {"Name": "c5", "Description": "Consumer Price Index, Services"},
+        {"Name": "c6", "Description": "Consumer Price Index, Shelter"},
+        {"Name": "c7", "Description": "Consumer Price Index, Core Goods"},
+        {"Name": "c8", "Description": "Consumer Price Index by State, Detail"},
+    ]
+    order = rank_member_series(cpi_members)
+    check("core CPI ranks above food and energy",
+          order.index("c2") < order.index("c3")
+          and order.index("c2") < order.index("c4"),
+          f"order={order}")
+    check("core goods also promoted", order.index("c7") < order.index("c3"),
+          f"order={order}")
+    check("a state-level breakdown ranks last", order[-1] == "c8", f"order={order}")
+    check("core CPI survives a cut at 5", "c2" in order[:5], f"top5={order[:5]}")
+
+    pmi_members = [
+        {"Name": "p1", "Description": "Manufacturing PMI"},
+        {"Name": "p2", "Description": "Manufacturing PMI, New Orders"},
+        {"Name": "p3", "Description": "Manufacturing PMI, Output Prices"},
+        {"Name": "p4", "Description": "Manufacturing PMI, Input Prices"},
+        {"Name": "p5", "Description": "Manufacturing PMI, Employment"},
+        {"Name": "p6", "Description": "Manufacturing PMI, Quantity of Purchases"},
+        {"Name": "p7", "Description": "Manufacturing PMI, Stocks of Finished Goods"},
+    ]
+    order = rank_member_series(pmi_members)
+    for keep in ("p2", "p3", "p4", "p5"):
+        check(f"PMI sub-index {keep} kept within the default cap",
+              order.index(keep) < DEFAULT_MAX_SERIES_PER_RELEASE, f"order={order}")
+    check("headline PMI still ranks first", order[0] == "p1", f"order={order}")
+    check("least informative sub-index ranks last", order[-1] == "p6", f"order={order}")
+
+    check("region filter drops foreign members",
+          rank_member_series([{"Name": "x", "Description": "A", "Region": "jp"}],
+                             ["us"]) == [])
+    check("a member with no region is kept",
+          rank_member_series([{"Name": "x", "Description": "A"}], ["us"]) == ["x"])
+    check("ranking is deterministic for equal scores",
+          rank_member_series(cpi_members) == rank_member_series(cpi_members))
+    check("default cap raised to carry sub-indices",
+          DEFAULT_MAX_SERIES_PER_RELEASE >= 12)
+
+    # 9h0. merging, so a second run on the same day adds to the first rather
+    # than replacing it. The incremental download means run two only carries
+    # what changed, so overwriting would destroy the morning's work.
+    run1 = [{"series": f"s{i}", "release_date": "2026-08-19", "z": 1.0, "abs_z": 1.0,
+             "latest": 100 + i} for i in range(100)]
+    run2 = [{"series": f"s{i}", "release_date": "2026-08-19", "z": 4.0, "abs_z": 4.0,
+             "latest": 999} for i in range(4)]
+
+    merged, carried, fresh = merge_rows(run1, run2, ("series", "release_date"))
+    check("merging keeps the earlier run's rows", len(merged) == 100, f"got {len(merged)}")
+    check("carried count excludes the replaced rows", carried == 96, f"got {carried}")
+    check("new count reported", fresh == 4, f"got {fresh}")
+    by_name = {r["series"]: r for r in merged}
+    check("a revised series takes the newer values", by_name["s1"]["latest"] == 999)
+    check("an untouched series keeps the earlier values", by_name["s50"]["latest"] == 150)
+
+    later = [{"series": "s500", "release_date": "2026-08-19", "z": 2.0, "abs_z": 2.0}]
+    merged2, carried2, _ = merge_rows(merged, later, ("series", "release_date"))
+    check("a genuinely new series is appended", len(merged2) == 101, f"got {len(merged2)}")
+    check("nothing is replaced when keys do not collide", carried2 == 100, f"got {carried2}")
+
+    other_day = [{"series": "s1", "release_date": "2026-08-20", "z": 3.0, "abs_z": 3.0}]
+    merged3, _, _ = merge_rows(merged, other_day, ("series", "release_date"))
+    check("the same series on another date is a separate row",
+          len(merged3) == 101, f"got {len(merged3)}")
+
+    check("merging an empty prior file is a no-op",
+          merge_rows([], run2, ("series", "release_date"))[0] == run2)
+    check("merging does not mutate either input",
+          len(run1) == 100 and len(run2) == 4, f"got {len(run1)}, {len(run2)}")
+
+    # rows read back from CSV are strings, and must still sort correctly
+    as_text = [{"series": "a", "release_date": "d", "abs_z": "3.5"},
+               {"series": "b", "release_date": "d", "abs_z": "0.2"},
+               {"series": "c", "release_date": "d", "abs_z": ""}]
+    ordered = sorted(as_text, key=_sort_key_abs_z)
+    check("string abs_z values sort numerically",
+          [r["series"] for r in ordered] == ["a", "b", "c"],
+          f"got {[r['series'] for r in ordered]}")
+
     # 9h. output paths
     d, stem = output_paths({"date": "2026-08-17"}, "/out", False)
     check("single-day path is filed under year/month",
@@ -3017,6 +3392,10 @@ def main() -> int:
     ap.add_argument("--self-contained", action="store_true",
                     help="also write the old per-scan HTML with the data baked in")
     ap.add_argument("--no-json", action="store_true", help="skip the JSON output")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="replace the day's files instead of merging into them. "
+                         "A re-run only downloads what changed since the last one, "
+                         "so this discards everything the earlier run found")
     ap.add_argument("--probe", action="store_true",
                     help="dump Release entity metadata shape and exit")
     ap.add_argument("--selftest", action="store_true",

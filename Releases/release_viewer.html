@@ -53,6 +53,17 @@ tr.m .z{color:var(--m);} tr.l .z{color:var(--l);}
 .kv b{color:var(--fg);font-weight:600;}
 .note{color:var(--dim);font-size:12px;margin-top:10px;max-width:85ch;}
 .empty{color:var(--dim);padding:22px 8px;text-align:center;}
+.tw{display:inline-block;width:12px;color:var(--dim);font-size:10px;}
+tr.grp>td{border-bottom:1px solid var(--line);}
+.pip{display:inline-block;min-width:16px;padding:1px 4px;margin-right:3px;border-radius:8px;
+font-size:10px;font-weight:700;text-align:center;color:#0f1115;}
+.pip.x{background:var(--x);} .pip.h{background:var(--h);} .pip.m{background:var(--m);}
+.alert{color:var(--h);}
+td.nested{padding:0 0 0 26px;background:rgba(127,127,127,.045);}
+table.inner{width:100%;border-collapse:collapse;}
+table.inner td{border-bottom:1px solid var(--line);}
+table.inner tr:last-child td{border-bottom:none;}
+.desc.head{font-weight:600;}
 details summary{cursor:pointer;color:var(--dim);font-size:12px;
 text-transform:uppercase;letter-spacing:.08em;font-weight:600;}
 #drop{border:2px dashed var(--line);border-radius:10px;padding:40px 20px;text-align:center;
@@ -97,6 +108,7 @@ color:var(--dim);transition:border-color .15s,background .15s;}
     <select id="day"><option value="">All dates</option></select>
     <span class="lab">Min |z| <b id="zval">0.0</b></span>
     <input type="range" id="zmin" min="0" max="4" step="0.25" value="0">
+    <button id="group" class="on">Group by release</button>
     <button id="limit" class="on">Top <span id="limn">50</span></button>
     <span class="lab" id="count"></span>
   </div>
@@ -136,7 +148,54 @@ color:var(--dim);transition:border-color .15s,background .15s;}
 (function(){
 var rows = [], rels = [], meta = {};
 var state = {q:'', zmin:0, sort:'abs_z', regions:new Set(), limit:true,
-             sortKey:null, sortDir:-1, day:'', top:50};
+             sortKey:null, sortDir:-1, day:'', top:50, group:true, open:{}};
+
+// ---- grouping -----------------------------------------------------------
+// One row per release, carrying the headline reading, with a signal when a
+// subcomponent moved. A dull headline over a violent sub-index is exactly the
+// case a flat list buries, because the group sorts on its worst member.
+function groupRows(list){
+  var byKey = {}, order = [];
+  list.forEach(function(r){
+    var k = r.release + '|' + (r.release_date || '');
+    if(!byKey[k]){ byKey[k] = {key:k, release:r.release, date:r.release_date,
+                               region:r.region, desc:r.release_description,
+                               time:r.event_time_local, members:[]}; order.push(k); }
+    byKey[k].members.push(r);
+  });
+  return order.map(function(k){
+    var g = byKey[k];
+    g.members.sort(function(a,b){
+      var ra = parseInt(a.member_rank,10), rb = parseInt(b.member_rank,10);
+      if(!isNaN(ra) && !isNaN(rb) && ra !== rb) return ra - rb;
+      return String(a.description).length - String(b.description).length;
+    });
+    g.headline = g.members[0];
+    g.rest = g.members.slice(1);
+    g.maxAbs = 0; g.worst = g.headline;
+    g.counts = {x:0, h:0, m:0};
+    g.members.forEach(function(r){
+      var a = Math.abs(r.z);
+      if(a > g.maxAbs){ g.maxAbs = a; g.worst = r; }
+      if(a >= 3) g.counts.x++; else if(a >= 2) g.counts.h++; else if(a >= 1.25) g.counts.m++;
+    });
+    // does anything other than the headline move?
+    g.subMax = 0;
+    g.rest.forEach(function(r){ g.subMax = Math.max(g.subMax, Math.abs(r.z)); });
+    return g;
+  });
+}
+
+function pips(g){
+  var out = '';
+  if(g.counts.x) out += '<span class="pip x" title="'+g.counts.x+' at 3 sd or more">'
+    + g.counts.x + '</span>';
+  if(g.counts.h) out += '<span class="pip h" title="'+g.counts.h+' at 2 sd or more">'
+    + g.counts.h + '</span>';
+  if(g.counts.m) out += '<span class="pip m" title="'+g.counts.m+' at 1.25 sd or more">'
+    + g.counts.m + '</span>';
+  return out;
+}
 
 function esc(s){ return String(s==null?'':s)
   .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
@@ -360,8 +419,111 @@ function filtered(){
   return out;
 }
 
+function memberCells(r, cls){
+  return '<td class="z">'+(r.z>0?'+':'')+Number(r.z).toFixed(2)+'</td>'
+    + '<td class="reg">'+esc(String(r.region).toUpperCase())+'</td>'
+    + '<td class="desc '+cls+'">'+esc(r.description)+'</td>'
+    + '<td class="num">'+esc(r.latest)+'</td>'
+    + '<td class="num">'+esc(r.previous)+'</td>'
+    + '<td class="num">'+(r.trend_break>0?'+':'')+Number(r.trend_break).toFixed(2)+'</td>'
+    + '<td class="num">'+Number(r.pctile).toFixed(0)+'</td>'
+    + '<td class="sp">'+esc(r.scored_on)+'</td>'
+    + '<td class="dt">'+esc(r.obs_date)+'</td>';
+}
+
+function detailRow(r, id){
+  return '<tr class="detail" id="'+id+'" style="display:none"><td colspan="9">'
+    + '<p class="about">'+esc(r.about||r.description)+'</p>'
+    + '<div class="kv">'
+    + '<span>Verdict <b>'+esc(r.verdict)+'</b></span>'
+    + '<span>Code <b>'+esc(r.series)+'</b></span>'
+    + (r.unit?'<span>Unit <b>'+esc(r.unit)+'</b></span>':'')
+    + (r.frequency?'<span>Frequency <b>'+esc(r.frequency)+'</b></span>':'')
+    + (r.source?'<span>Source <b>'+esc(r.source)+'</b></span>':'')
+    + '<span>History <b>'+esc(r.n_obs)+' obs</b></span>'
+    + (r.window_obs?'<span>Benchmark <b>'+esc(r.window_obs)+' obs / '
+       + esc(r.window_years)+' yrs</b></span>':'')
+    + (r.scale_kind?'<span>Scale <b>'+esc(r.scale_kind)+'</b></span>':'')
+    + '<span>Status <b>'+esc(r.status)+'</b></span>'
+    + '</div></td></tr>';
+}
+
+function drawGrouped(all){
+  var groups = groupRows(all);
+  groups.sort(function(a,b){
+    if(state.sortKey || state.sort!=='abs_z'){
+      // fall back to the headline's own ordering under an explicit sort
+      return Math.abs(b.headline.z) - Math.abs(a.headline.z);
+    }
+    return b.maxAbs - a.maxAbs;      // a group is as interesting as its worst member
+  });
+  var show = state.limit ? groups.slice(0, state.top) : groups;
+  document.getElementById('count').textContent =
+    'showing '+show.length+' of '+groups.length+' releases · '+all.length+' series';
+
+  var tb = document.getElementById('tb'), html='';
+  if(!show.length){
+    tb.innerHTML='<tr><td colspan="9" class="empty">Nothing matches these filters.</td></tr>';
+    return;
+  }
+  show.forEach(function(g, gi){
+    var h = g.headline, opened = !!state.open[g.key];
+    var flag = g.subMax >= 2 && Math.abs(h.z) < 2;
+    html += '<tr class="row grp '+band(g.maxAbs>=Math.abs(h.z)?g.worst.z:h.z)
+      + '" data-g="'+gi+'">'
+      + '<td class="z">'+(h.z>0?'+':'')+Number(h.z).toFixed(2)+'</td>'
+      + '<td class="reg">'+esc(String(g.region).toUpperCase())+'</td>'
+      + '<td class="desc"><span class="tw">'+(opened?'▾':'▸')+'</span> '
+      + esc(h.description)
+      + '<span class="sub">'+esc(g.desc)
+      + (g.date? ' · '+esc(g.date):'')
+      + (g.members.length>1? ' · '+g.members.length+' series':'')
+      + (flag? ' · <b class="alert">subcomponent '
+          + (g.worst.z>0?'+':'') + Number(g.worst.z).toFixed(1) + ' sd</b>' : '')
+      + '</span></td>'
+      + '<td class="num">'+esc(h.latest)+'</td>'
+      + '<td class="num">'+esc(h.previous)+'</td>'
+      + '<td class="num">'+(h.trend_break>0?'+':'')+Number(h.trend_break).toFixed(2)+'</td>'
+      + '<td class="num">'+Number(h.pctile).toFixed(0)+'</td>'
+      + '<td class="sp">'+pips(g)+'</td>'
+      + '<td class="dt">'+esc(h.obs_date)+'</td></tr>';
+
+    var style = opened ? '' : ' style="display:none"';
+    html += '<tr class="member" data-grp="'+gi+'"'+style+'>'
+      + '<td colspan="9" class="nested"><table class="inner">';
+    g.members.forEach(function(r, mi){
+      html += '<tr class="row '+band(r.z)+'" data-i="'+gi+'_'+mi+'">'
+        + memberCells(r, mi===0 ? 'head' : '') + '</tr>'
+        + detailRow(r, 'd'+gi+'_'+mi);
+    });
+    html += '</table></td></tr>';
+  });
+  tb.innerHTML = html;
+
+  Array.prototype.forEach.call(tb.querySelectorAll('tr.grp'), function(tr){
+    tr.onclick = function(){
+      var gi = tr.getAttribute('data-g');
+      var key = show[parseInt(gi,10)].key;
+      state.open[key] = !state.open[key];
+      var body = tb.querySelector('tr.member[data-grp="'+gi+'"]');
+      if(body) body.style.display = state.open[key] ? 'table-row' : 'none';
+      var tw = tr.querySelector('.tw');
+      if(tw) tw.textContent = state.open[key] ? '▾' : '▸';
+    };
+  });
+  Array.prototype.forEach.call(tb.querySelectorAll('tr.inner, table.inner tr.row'),
+    function(tr){
+      tr.onclick = function(e){
+        e.stopPropagation();
+        var d = document.getElementById('d'+tr.getAttribute('data-i'));
+        if(d) d.style.display = d.style.display==='none' ? 'table-row' : 'none';
+      };
+    });
+}
+
 function draw(){
   var all=filtered();
+  if(state.group){ drawGrouped(all); return; }
   var show = state.limit ? all.slice(0, state.top) : all;
   document.getElementById('count').textContent =
     'showing '+show.length+' of '+all.length+
@@ -459,6 +621,8 @@ document.getElementById('zmin').oninput=function(e){
 document.getElementById('limit').onclick=function(){
   state.limit=!state.limit; this.classList.toggle('on',state.limit);
   this.firstChild.textContent = state.limit?'Top ':'Show all '; draw(); };
+document.getElementById('group').onclick=function(){
+  state.group=!state.group; this.classList.toggle('on',state.group); draw(); };
 
 function markSort(){
   Array.prototype.forEach.call(document.querySelectorAll('th .ar'),function(a){a.textContent='';});
